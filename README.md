@@ -28,5 +28,5 @@ python py_point_mask.py
   --target ./plot_cloud.laz    # The single large target point cloud
   --distance 0.5               # Distance threshold (in file units)
   --output ./extracted_trees   # (Optional) Output directory
-  --chunk-size 50000           # (Optional) Points per chunk (Def: 500k)
+  --chunk-size 500000          # (Optional) Points per chunk (Default: 500000)
 ```
