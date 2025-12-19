@@ -23,7 +23,7 @@ pip install "laspy[lazrs]"
 
 ## Usage
 ```
-python py_point_mask.py \
+python py_point_mask.py
   --mask-folder ./my_masks/    # Folder containing mask files (.ply, .las, .laz)
   --target ./plot_cloud.laz    # The single large target point cloud
   --distance 0.5               # Distance threshold (in file units)
