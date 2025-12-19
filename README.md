@@ -19,3 +19,14 @@ pip install numpy scipy plyfile tqdm
 
 # Install laspy with LAZ compression support
 pip install "laspy[lazrs]"
+```
+
+## Usage
+```
+python py_point_mask.py \
+  --mask-folder ./my_masks/    # Folder containing mask files (.ply, .las, .laz)
+  --target ./plot_cloud.laz    # The single large target point cloud
+  --distance 0.5               # Distance threshold (in file units)
+  --output ./extracted_trees   # (Optional) Output directory
+  --chunk-size 50000           # (Optional) Points per chunk (Def: 500k)
+```
