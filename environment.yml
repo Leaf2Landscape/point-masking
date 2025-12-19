@@ -1,0 +1,13 @@
+name: point_masking
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - scipy
+  - pip:
+    - plyfile
+    - tqdm
+    - laspy[lazrs]  # Includes the Rust backend for fast LAZ compression
