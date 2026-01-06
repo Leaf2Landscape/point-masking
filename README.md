@@ -5,7 +5,7 @@ A high-performance Python tool for extracting subsets of points from a massive t
 ## Features
 
 - **Single-Pass Multiplexing:** Reads the massive target file once, checking against all masks simultaneously.
-- **Attribute Preservation:** Keeps **all** original LAS/LAZ attributes (Intensity, GPS Time, Return Number, Classification, etc.).
+- **Attribute Preservation:** Keeps **all** original LAS/LAZ/PLY attributes (Intensity, GPS Time, Return Number, Classification, etc.).
 - **Optimized Performance:** Uses KD-Tree spatial indexing with "Fast Reject" bounding boxes and C-level distance pruning.
 - **Memory Efficient:** Streams the target file in chunks; only mask points are held in RAM.
 
