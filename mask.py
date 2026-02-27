@@ -13,6 +13,63 @@ import contextlib
 
 # --- Helper Functions ---
 
+# --- PLY additive writer (valid final PLY) ---
+
+class PlyAppender:
+    """
+    Accumulates vertices in a temporary binary file during the run.
+    On finalize(), writes a single valid PLY (binary_little_endian) with the
+    correct vertex count and appends the body.
+    """
+    def __init__(self, out_path: Path):
+        self.out_path = out_path
+        self.tmp_path = out_path.with_suffix(out_path.suffix + ".bin")
+        # Fresh start for this run
+        if self.out_path.exists():
+            self.out_path.unlink()
+        if self.tmp_path.exists():
+            self.tmp_path.unlink()
+        self.count = 0
+        # Open temp body file in append-binary mode
+        self.tmp_f = open(self.tmp_path, 'ab')
+
+    def append(self, xyz: np.ndarray):
+        """Append an (N,3) float array to the temp body as float32 LE."""
+        if xyz is None or xyz.size == 0:
+            return
+        arr = np.asarray(xyz, dtype='<f4', order='C')  # float32 little-endian
+        self.tmp_f.write(arr.tobytes())
+        self.count += arr.shape[0]
+
+    def close(self):
+        if not self.tmp_f.closed:
+            self.tmp_f.close()
+
+    def finalize(self):
+        """Write one valid PLY with correct header + body, then cleanup."""
+        self.close()
+        header = (
+            "ply\n"
+            "format binary_little_endian 1.0\n"
+            f"element vertex {self.count}\n"
+            "property float x\n"
+            "property float y\n"
+            "property float z\n"
+            "end_header\n"
+        ).encode('ascii')
+        # Write header
+        with open(self.out_path, 'wb') as fout:
+            fout.write(header)
+        # Append body
+        with open(self.out_path, 'ab') as fout, open(self.tmp_path, 'rb') as ftmp:
+            for chunk in iter(lambda: ftmp.read(1 << 20), b''):
+                fout.write(chunk)
+        # Remove temp
+        try:
+            os.remove(self.tmp_path)
+        except OSError:
+            pass
+
 def get_points(filepath):
     """Reads XYZ coordinates from PLY or LAS/LAZ files efficiently."""
     ext = Path(filepath).suffix.lower()
@@ -85,6 +142,13 @@ def main():
         out_dir = Path(f"{args.mask_folder.name}_extracted")
     
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.target.is_dir():
+        target_exts = list(args.target.glob("*.ply")) + list(args.target.glob("*.las")) + list(args.target.glob("*.laz"))
+        suffix = target_exts[0].suffix if target_exts else '.ply'
+    else:
+        suffix = args.target.suffix
+    producing_ply = suffix.lower() == '.ply'
     
     # 2. Load All Masks into Memory
     masks = []
@@ -109,10 +173,8 @@ def main():
         # Calculate bounds for Fast-Reject BBox check
         mins = np.min(pts, axis=0) - args.distance
         maxs = np.max(pts, axis=0) + args.distance
-        
-        # Determine output filename (MaskName + TargetExtension)
-        # e.g. tree_01.ply -> tree_01.las
-        out_path = out_dir / (f.stem + args.target.suffix)
+
+        out_path = out_dir / f"{f.stem}_mask{suffix}"
         
         masks.append({
             'name': f.name,
@@ -144,10 +206,17 @@ def main():
         sys.exit(1)
 
     # 4. Clear existing mask outputs if they exist (to avoid appending to old files)
+    removed_outputs = 0
     for m in masks:
         if m['out_path'].exists():
-            print(f"Removing existing output file: {m['out_path']}")
             m['out_path'].unlink()
+            removed_outputs += 1
+    if removed_outputs > 0:
+        print(f"Removed {removed_outputs} existing output files to start fresh.")
+
+    if producing_ply:
+        for m in masks:
+            m['writer'] = PlyAppender(m['out_path'])
 
     # 5. For each target, stream ONCE
     # ExitStack ensures all file handles (input + all outputs) close safely
@@ -193,16 +262,6 @@ def main():
                     total_points = ply['vertex'].count
                     pts = np.vstack((ply['vertex']['x'], ply['vertex']['y'], ply['vertex']['z'])).T
                     
-                    # Open All Outputs
-                    for m in masks:
-                        # Append mode if file exists, write mode for first target
-                        file_mode = 'ab' if m['out_path'].exists() else 'wb'
-                        m['writer'] = stack.enter_context(open(m['out_path'], file_mode))
-                        # Only write empty header for new files
-                        if file_mode == 'wb':
-                            ply['vertex'].data = np.empty(0, dtype=ply['vertex'].dtype())
-                            PlyData(ply.elements).write(m['writer'])
-                    
                     # Iterate Chunks
                     with tqdm(total=total_points, unit="pts") as pbar:
                         for start_idx in range(0, total_points, args.chunk_size):
@@ -214,19 +273,9 @@ def main():
                             
                             # Write points to their closest matching mask
                             for mask_idx, m in enumerate(masks):
-                                final_mask = matched_mask_idx == mask_idx
-                                if np.any(final_mask):
-                                    filtered_data = chunk_xyz[final_mask] if chunk_xyz.size > 0 else np.empty((0, 3))
-                                    if filtered_data.size > 0:
-                                        # Create a new structured array for the filtered points
-                                        vertex_dtype = ply['vertex'].dtype()
-                                        filtered_structured = np.empty(filtered_data.shape[0], dtype=vertex_dtype)
-                                        filtered_structured['x'] = filtered_data[:, 0]
-                                        filtered_structured['y'] = filtered_data[:, 1]
-                                        filtered_structured['z'] = filtered_data[:, 2]
-                                        filtered_vertex = PlyElement.describe(filtered_structured, 'vertex')
-                                        PlyData([filtered_vertex]).write(m['writer'])
-
+                                sel = (matched_mask_idx == mask_idx)
+                                if np.any(sel):
+                                    m['writer'].append(chunk_xyz[sel])
                             pbar.update(end_idx - start_idx)
                 
                 else:
@@ -239,6 +288,10 @@ def main():
                     print("Run 'ulimit -n 4096' in your terminal and try again.")
                 else:
                     raise e
+                
+    # Finalize all PLY outputs
+    for m in masks:
+        m['writer'].finalize()
 
     elapsed = time.time() - start_time
     print(f"\nDone. Processed {total_points} points in {elapsed:.2f}s.")
