@@ -37,12 +37,10 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "args": [
-                "-e", "~/projects/ROBSON_segfix_test/trees/train",
-                "-c", "~/projects/ROBSON_segfix_test/individual_trees/matched",
-                "-o", "~/projects/ROBSON_segfix_test/seg_mask_output",
-                "-d", "2.0",
-                "--threads", "1",
-            ]
+                "-c", "~/projects/ROBSON_segfix_test/individual_trees/old_points",
+                "-e", "~/projects/ROBSON_segfix_test/trees/unique_trees",
+                "-o", "~/projects/ROBSON_segfix_test/masked_output",
+                "-scf"]
         },
     ]
 }

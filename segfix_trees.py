@@ -15,15 +15,17 @@ with **current (A)** points using the *fast* processing logic you provided:
   2) For points that failed primary, try **alternative B candidates** and assign to the
      closest that satisfies the threshold; otherwise, fall back to the primary.
   3) Use **expanded B bboxes** to cull NN queries (fast reject), just like your script.
-- **Outputs (one per B)**: we **add B's own points** *and* the assigned A points into a
-  single PLY stream with per-vertex fields `(x, y, z, current_id, match_flag, src)`:
-    - `current_id`: integer id of the source A file (0 for B core points)
-    - `match_flag`: 1 if A∩B (matched to some candidate); 0 if A-only (fallback to primary);
-                    -1 for B core points
-    - `src`: 0 for B core points; 1 for A points
+- **Outputs (one per B, split by confidence)**: we **add B's own points** *and* the assigned A points into
+   separate PLY streams per confidence tier:
+   - `{tree}_matched.ply` — match_flag=1 (high confidence, near B)
+   - `{tree}_uncertain.ply` — match_flag=0 (fallback to primary, far from any B)
+   Per-vertex fields: `(x, y, z, current_id, match_flag, src)`:
+    - `current_id`: integer id of the source A file
+    - `match_flag`: 1 if A∩B (matched to some candidate); 0 if A-only (fallback to primary)
+    - `src`: 1 for A points (B core points are in separate handling)
 
-This creates exactly what you asked: **masked points of B added** plus the **leftover A
-points** that belong to that B after reassignment.
+This creates high-confidence matched outputs (tier 1) separated from fallback-uncertain 
+outputs (tier 2) for staged manual review. Unassigned current files are copied through unchanged.
 
 The writer is a **single-phase appender** (no memmap stitching, no temporary .npy chunks),
 so I/O is minimal and RAM stays flat. LAS/LAZ reading is chunked via laspy; PLY/A reading
@@ -56,6 +58,7 @@ import argparse
 import csv
 import sys
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
@@ -68,6 +71,72 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 SUPPORTED_EXTS = {'.ply', '.las', '.laz'}
+RESERVED_OUTPUT_FIELDS = {'x', 'y', 'z', 'current_id', 'match_flag', 'src'}
+
+
+def _normalize_passthrough_dtype(src_dtype: np.dtype) -> np.dtype:
+    """Map source numeric dtypes to writer-supported output dtypes."""
+    dt = np.dtype(src_dtype)
+    if dt.kind in ('f',):
+        return np.dtype('<f4')
+    if dt.kind in ('i', 'u', 'b'):
+        return np.dtype('<i4')
+    raise TypeError(f'Unsupported passthrough dtype: {dt}')
+
+
+def infer_passthrough_fields(a_files: List[Path]) -> List[Tuple[str, np.dtype]]:
+    """Infer passthrough fields by scanning A files and taking schema union."""
+    field_map: Dict[str, np.dtype] = {}
+
+    for path in a_files:
+        ext = path.suffix.lower()
+        try:
+            if ext == '.ply':
+                with open(path, 'rb') as f:
+                    ply = PlyData.read(f)
+                v = ply['vertex']
+                names = list(v.data.dtype.names or [])
+                for name in names:
+                    if name in RESERVED_OUTPUT_FIELDS or name in ('x', 'y', 'z'):
+                        continue
+                    src_dt = np.dtype(v.data.dtype.fields[name][0])
+                    try:
+                        out_dt = _normalize_passthrough_dtype(src_dt)
+                    except TypeError:
+                        continue
+                    prev = field_map.get(name)
+                    if prev is None or (prev == np.dtype('<i4') and out_dt == np.dtype('<f4')):
+                        field_map[name] = out_dt
+                continue
+
+            if ext in ('.las', '.laz'):
+                with laspy.open(path) as src:
+                    dim_names = list(src.point_format.dimension_names)
+                    it = src.chunk_iterator(1)
+                    first_chunk = next(it, None)
+                if first_chunk is None:
+                    continue
+                for name in dim_names:
+                    lname = name.lower()
+                    if lname in RESERVED_OUTPUT_FIELDS or lname in ('x', 'y', 'z'):
+                        continue
+                    if not hasattr(first_chunk, name):
+                        continue
+                    vals = np.asarray(getattr(first_chunk, name))
+                    if vals.size == 0:
+                        continue
+                    try:
+                        out_dt = _normalize_passthrough_dtype(vals.dtype)
+                    except TypeError:
+                        continue
+                    prev = field_map.get(name)
+                    if prev is None or (prev == np.dtype('<i4') and out_dt == np.dtype('<f4')):
+                        field_map[name] = out_dt
+        except Exception as e:
+            print(f"Warning: failed to infer passthrough fields from {path}: {e}")
+            continue
+
+    return list(field_map.items())
 
 # ---------------- PLY structured appender ----------------
 class PlyStructAppender:
@@ -111,6 +180,8 @@ class PlyStructAppender:
                 lines.append(f"property float {name}")
             elif t == np.dtype('<i4'):
                 lines.append(f"property int {name}")
+            elif t == np.dtype('<u1'):
+                lines.append(f"property uchar {name}")
             else:
                 raise TypeError(f"Unsupported dtype for PLY: {name}:{t}")
         lines.append("end_header")
@@ -126,6 +197,18 @@ class PlyStructAppender:
                 fout.write(chunk)
         try:
             os.remove(self.tmp_path)
+        except OSError:
+            pass
+
+    def discard(self):
+        """Drop temporary state without producing an output PLY."""
+        self.close()
+        try:
+            os.remove(self.tmp_path)
+        except OSError:
+            pass
+        try:
+            os.remove(self.out_path)
         except OSError:
             pass
 
@@ -152,6 +235,13 @@ def read_xyz(path: Path) -> np.ndarray:
 
 def list_point_files(folder: Path) -> List[Path]:
     return [p for p in sorted(folder.iterdir()) if p.suffix.lower() in SUPPORTED_EXTS and p.is_file()]
+
+
+def read_ply_vertex_records(path: Path) -> np.ndarray:
+    """Read binary/ascii PLY vertex records as a structured numpy array."""
+    with open(path, 'rb') as f:
+        ply = PlyData.read(f)
+    return np.asarray(ply['vertex'].data)
 
 # ---------------- Geometry & trees ----------------
 @dataclass
@@ -307,6 +397,7 @@ def main():
     ap.add_argument('-c', '--current-folder', type=Path, required=True, help='Folder of current A masks (.ply/.las/.laz)')
     ap.add_argument('-e', '--existing-folder', type=Path, required=True, help='Folder of existing B masks (.ply/.las/.laz)')
     ap.add_argument('-o', '--output', type=Path, required=True, help='Output folder for per-B PLY files')
+    ap.add_argument('-scf', '--save-current-filename', action='store_true', help='Rename the saved output files to the majority contributing current_id filename')
 
     # HAG & base
     ap.add_argument('--hag-percentile', type=float, default=0.02, help='Percentile of z as ground (default 0.02)')
@@ -318,7 +409,7 @@ def main():
     ap.add_argument('--k-alt', type=int, default=5, help='If no within-gate, use k nearest Bs (<=0 → all)')
 
     # Distance & performance
-    ap.add_argument('-d', '--distance', type=float, default=1.0, help='NN distance threshold (m) for a good B match')
+    ap.add_argument('-d', '--distance', type=float, default=0.5, help='NN distance threshold (m) for a good B match')
     ap.add_argument('--chunk-size', type=int, default=500000, help='Points per chunk for A')
     ap.add_argument('--workers', type=int, default=None, help='Threads for processing A files in parallel (default 1, set >1 to parallelize across A files). Default physical cpus')
     ap.add_argument('--threads', type=int, default=None, help='Threads for KD queries inside SciPy (pick 1 if you parallelize elsewhere). Default logical cores - physical cpus')
@@ -356,20 +447,30 @@ def main():
         b_files, args.hag_percentile, base_low, base_high, args.fallback_percent, args.distance, verbose=True
     )
 
+    passthrough_fields = infer_passthrough_fields(a_files)
+    if passthrough_fields:
+        print('Passthrough fields:', ', '.join(name for name, _ in passthrough_fields))
+    else:
+        print('Passthrough fields: none')
+
     # Structured dtype for output
-    out_dtype = np.dtype([
+    out_dtype_fields: List[Tuple[str, str]] = [
         ('x','<f4'), ('y','<f4'), ('z','<f4'),
         ('current_id','<i4'), ('match_flag','<i4'), ('src','<i4')
-    ])
+    ]
+    out_dtype_fields.extend((name, str(dt)) for name, dt in passthrough_fields)
+    out_dtype = np.dtype(out_dtype_fields)
 
-    # One appender per B, write B core first
-    appenders: List[PlyStructAppender] = []
-    counts_total = np.zeros((len(ref_list),), dtype=np.int64)
-    counts_match = np.zeros((len(ref_list),), dtype=np.int64)
-    counts_aonly = np.zeros((len(ref_list),), dtype=np.int64)
+    # Two appenders per B: matched and uncertain tiers
+    appenders_matched: List[PlyStructAppender] = []
+    appenders_uncertain: List[PlyStructAppender] = []
+    counts_matched = np.zeros((len(ref_list),), dtype=np.int64)
+    counts_uncertain = np.zeros((len(ref_list),), dtype=np.int64)
     for bidx, ref in enumerate(ref_list):
-        app = PlyStructAppender(out_dir / f"{ref.name}_collected.ply", out_dtype)
-        appenders.append(app)
+        app_m = PlyStructAppender(out_dir / f"{ref.name}_matched.ply", out_dtype)
+        app_u = PlyStructAppender(out_dir / f"{ref.name}_uncertain.ply", out_dtype)
+        appenders_matched.append(app_m)
+        appenders_uncertain.append(app_u)
 
     # current_id to filename mapping
     rct_id_map: Dict[int, str] = {}
@@ -377,11 +478,23 @@ def main():
         rct_id_map[idx] = a_path.name
 
     print(f'Processing {len(a_files)} current (A) masks ...')
+    passthrough_copied = 0
     
     def process_a_file(a_path):
         """Process a single A file and return results to accumulate."""
         ext = a_path.suffix.lower()
         cid = next(k for k, v in rct_id_map.items() if v == a_path.name)
+
+        passthrough_names = [name for name, _ in passthrough_fields]
+
+        def convert_passthrough_chunk(chunk_data: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+            out: Dict[str, np.ndarray] = {}
+            for name, out_dt in passthrough_fields:
+                vals = chunk_data.get(name)
+                if vals is None:
+                    continue
+                out[name] = np.asarray(vals).astype(out_dt, copy=False)
+            return out
         
         # Load base for this A
         if ext in ('.las','.laz'):
@@ -396,7 +509,7 @@ def main():
             v = ply['vertex']
             a_xyz_sample = np.vstack((v['x'], v['y'], v['z'])).T.astype(np.float32, copy=False)
         else:
-            return None
+            return {'mode': 'skip', 'cid': cid, 'path': a_path}
         
         a_hag, _ = estimate_hag(a_xyz_sample, args.hag_percentile)
         a_base = compute_base_xy(a_xyz_sample, a_hag, base_low, base_high, fallback_percent=args.fallback_percent)
@@ -405,7 +518,8 @@ def main():
         primary_idx, candidates = choose_primary_and_candidates(a_base, ref_base_kd, len(ref_list), args.gate, args.k_alt)
         
         if primary_idx is None:
-            return None, None  # skip this A file if no valid primary
+            # No confident primary B for this A: pass file through unchanged.
+            return {'mode': 'copy_passthrough', 'cid': cid, 'path': a_path}
 
         # Collect results: (bidx, pts, match_flag)
         results = [[] for _ in range(len(ref_list))]
@@ -414,24 +528,42 @@ def main():
             with laspy.open(a_path) as src:
                 for chunk in src.chunk_iterator(args.chunk_size):
                     chunk_xyz = np.vstack((chunk.x, chunk.y, chunk.z)).T.astype(np.float32, copy=False)
+                    passthrough_chunk = convert_passthrough_chunk({
+                        name: np.asarray(getattr(chunk, name)) for name in passthrough_names if hasattr(chunk, name)
+                    })
                     assigned_b, match_flag = assign_chunk_primary_then_alts(
                         chunk_xyz, primary_idx, candidates, ref_list, bboxes, args.distance, args.threads)
                     for bidx in np.unique(assigned_b):
                         sel = (assigned_b == bidx)
-                        results[bidx].append((chunk_xyz[sel], match_flag[sel]))
+                        results[bidx].append((
+                            chunk_xyz[sel],
+                            match_flag[sel],
+                            {name: vals[sel] for name, vals in passthrough_chunk.items()}
+                        ))
         else:  # PLY
-            v = PlyData.read(a_path)['vertex']
+            with open(a_path, 'rb') as f:
+                v = PlyData.read(f)['vertex']
             pts = np.vstack((v['x'], v['y'], v['z'])).T.astype(np.float32, copy=False)
             for s in range(0, pts.shape[0], args.chunk_size):
                 e = min(s + args.chunk_size, pts.shape[0])
                 chunk_xyz = pts[s:e]
+                passthrough_chunk = convert_passthrough_chunk({
+                    name: np.asarray(v[name][s:e]) for name in passthrough_names if name in v.data.dtype.names
+                })
                 assigned_b, match_flag = assign_chunk_primary_then_alts(
                     chunk_xyz, primary_idx, candidates, ref_list, bboxes, args.distance, args.threads)
                 for bidx in np.unique(assigned_b):
                     sel = (assigned_b == bidx)
-                    results[bidx].append((chunk_xyz[sel], match_flag[sel]))
+                    results[bidx].append((
+                        chunk_xyz[sel],
+                        match_flag[sel],
+                        {name: vals[sel] for name, vals in passthrough_chunk.items()}
+                    ))
         
-        return cid, results
+        return {'mode': 'assigned', 'cid': cid, 'results': results}
+    
+    # Track current_ids per existing mask with point counts per current_id
+    current_ids_per_b: List[Dict[int, int]] = [{} for _ in range(len(ref_list))]
     
     # Process A files in parallel
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
@@ -441,26 +573,60 @@ def main():
             if result is None:
                 continue
 
-            cid, results = result
+            mode = result.get('mode')
+            if mode == 'copy_passthrough':
+                src_path = result['path']
+                dst_path = out_dir / src_path.name
+                shutil.copy2(src_path, dst_path)
+                passthrough_copied += 1
+                continue
+
+            if mode != 'assigned':
+                continue
+
+            cid = result.get('cid')
+            results = result.get('results')
             if cid is None or results is None:
                 continue
             for bidx, chunks in enumerate(results):
-                for pts, mflags in chunks:
+                if len(chunks) > 0:
+                    if cid not in current_ids_per_b[bidx]:
+                        current_ids_per_b[bidx][cid] = 0
+                for pts, mflags, passthrough_chunk in chunks:
                     if pts.shape[0] == 0:
                         continue
-                    recs = np.empty(pts.shape[0], dtype=out_dtype)
+                    recs = np.zeros(pts.shape[0], dtype=out_dtype)
                     recs['x'], recs['y'], recs['z'] = pts[:,0], pts[:,1], pts[:,2]
                     recs['current_id'][:] = cid
                     recs['match_flag'][:] = mflags
                     recs['src'][:] = 1
-                    appenders[bidx].append(recs)
-                    counts_total[bidx] += pts.shape[0]
-                    counts_match[bidx] += int((mflags == 1).sum())
-                    counts_aonly[bidx] += int((mflags == 0).sum())
+                    for name, vals in passthrough_chunk.items():
+                        recs[name] = vals
+                    
+                    # Split by confidence tier
+                    matched_sel = (mflags == 1)
+                    uncertain_sel = (mflags == 0)
+                    
+                    if np.any(matched_sel):
+                        appenders_matched[bidx].append(recs[matched_sel])
+                        counts_matched[bidx] += int(matched_sel.sum())
+                    if np.any(uncertain_sel):
+                        appenders_uncertain[bidx].append(recs[uncertain_sel])
+                        counts_uncertain[bidx] += int(uncertain_sel.sum())
+                    
+                    current_ids_per_b[bidx][cid] += pts.shape[0]
 
-    # Finalize all B outputs
-    for app in appenders:
-        app.finalize()
+    # Finalize all B outputs (skip empty tiers to avoid empty files)
+    for app in appenders_matched:
+        if app.count > 0:
+            app.finalize()
+        else:
+            app.discard()
+    for app in appenders_uncertain:
+        if app.count > 0:
+            app.finalize()
+        else:
+            app.discard()
 
     # current_id_map.csv
     with open(out_dir / 'current_id_map.csv', 'w', newline='') as f:
@@ -473,11 +639,64 @@ def main():
     report_path = args.report if args.report is not None else (out_dir / 'merge_report.csv')
     with open(report_path, 'w', newline='') as f:
         w = csv.writer(f)
-        w.writerow(['existing_name', 'points_total', 'points_A_and_B', 'points_A_only'])
+        w.writerow(['existing_name', 'points_matched', 'points_uncertain', 'current_ids'])
         for bidx, ref in enumerate(ref_list):
-            w.writerow([ref.name, int(counts_total[bidx]), int(counts_match[bidx]), int(counts_aonly[bidx])])
+            # Sort current_ids by contribution (descending)
+            sorted_cids = sorted(current_ids_per_b[bidx].items(), key=lambda x: x[1], reverse=True)
+            cid_list = ','.join(f"{cid}({count})" for cid, count in sorted_cids)
+            w.writerow([ref.name, int(counts_matched[bidx]), int(counts_uncertain[bidx]), cid_list])
+
+    # If --save-current-filename, merge duplicate-majority outputs and rename by majority current filename
+    if args.save_current_filename:
+        majority_groups: Dict[str, List[int]] = {}
+        for bidx, _ref in enumerate(ref_list):
+            if len(current_ids_per_b[bidx]) == 0:
+                continue
+            majority_cid = max(current_ids_per_b[bidx].items(), key=lambda x: x[1])[0]
+            majority_name = rct_id_map.get(majority_cid, f"current_{majority_cid}")
+            majority_name = majority_name.replace('.ply', '').replace('.las', '').replace('.laz', '')
+            majority_groups.setdefault(majority_name, []).append(bidx)
+
+        for majority_name, bidx_group in majority_groups.items():
+            for suffix in ['_matched', '_uncertain']:
+                src_paths = [
+                    out_dir / f"{ref_list[bidx].name}{suffix}.ply"
+                    for bidx in bidx_group
+                    if (out_dir / f"{ref_list[bidx].name}{suffix}.ply").exists()
+                ]
+                if len(src_paths) == 0:
+                    continue
+
+                dst_path = out_dir / f"{majority_name}{suffix}.ply"
+                if len(src_paths) == 1:
+                    src = src_paths[0]
+                    if src != dst_path:
+                        src.rename(dst_path)
+                    continue
+
+                merged_tmp_path = out_dir / f"{majority_name}{suffix}.merge_tmp.ply"
+                merger = PlyStructAppender(merged_tmp_path, out_dtype)
+                for src in src_paths:
+                    recs = read_ply_vertex_records(src)
+                    if recs.size > 0:
+                        merger.append(recs)
+                if merger.count > 0:
+                    merger.finalize()
+                    if dst_path.exists() and dst_path != merged_tmp_path:
+                        dst_path.unlink()
+                    merged_tmp_path.rename(dst_path)
+                else:
+                    merger.discard()
+
+                for src in src_paths:
+                    if src.exists() and src != dst_path:
+                        src.unlink()
+
+        print('Renamed/merged output files based on majority contributing current_id.')
 
     print(f"Done. Wrote per-existing outputs to {out_dir}.")
+    if passthrough_copied > 0:
+        print(f"Copied {passthrough_copied} unmatched current file(s) through to output.")
     print(f"Current-ID map: {out_dir / 'current_id_map.csv'}")
     print(f"Report: {report_path}")
 
