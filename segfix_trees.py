@@ -36,8 +36,8 @@ Requirements:
 
 Usage:
   python seg_mask_from_existing_stream.py \
-    -c /path/to/current_A \
-    -e /path/to/existing_B \
+        /path/to/trees_to_correct \
+        -m /path/to/correct_masks \
     -o /path/to/output \
     --gate 1.5 \
     --base-slice 0.10 0.40 \
@@ -324,9 +324,10 @@ def ensure_ref_kd(ref: RefTree) -> cKDTree:
 # ---------------- Assignment with bbox + primary-first ----------------
 
 def choose_primary_and_candidates(a_base: np.ndarray, ref_base_kd: cKDTree, total_b: int,
-                                  gate: float, k_alt: int) -> Tuple[int, List[int]]:
+                                  gate: float, k_alt: int,
+                                  primary_max_distance: float = 0.2) -> Tuple[int, List[int]]:
     d, primary_idx = ref_base_kd.query(a_base, k=1)
-    if d > 0.2:
+    if d > primary_max_distance:
         primary_idx = None
     else:
         primary_idx = int(primary_idx)
@@ -394,8 +395,8 @@ def assign_chunk_primary_then_alts(a_xyz: np.ndarray, primary_idx: int, candidat
 
 def main():
     ap = argparse.ArgumentParser(description='Streaming A→B merge that writes one PLY per B with B core + assigned A points.')
-    ap.add_argument('-c', '--current-folder', type=Path, required=True, help='Folder of current A masks (.ply/.las/.laz)')
-    ap.add_argument('-e', '--existing-folder', type=Path, required=True, help='Folder of existing B masks (.ply/.las/.laz)')
+    ap.add_argument('input_folder', type=Path, help='Folder of trees to correct / mask (.ply/.las/.laz)')
+    ap.add_argument('-m', '--mask_dir', type=Path, required=True, help='Folder of correct masks to use (.ply/.las/.laz)')
     ap.add_argument('-o', '--output', type=Path, required=True, help='Output folder for per-B PLY files')
     ap.add_argument('-scf', '--save-current-filename', action='store_true', help='Rename the saved output files to the majority contributing current_id filename')
 
@@ -407,6 +408,8 @@ def main():
     # Matching
     ap.add_argument('--gate', type=float, default=1.5, help='Base-XY gating radius for B candidates')
     ap.add_argument('--k-alt', type=int, default=5, help='If no within-gate, use k nearest Bs (<=0 → all)')
+    ap.add_argument('--primary-max-distance', type=float, default=0.2,
+                    help='Maximum base distance (m) allowed for selecting a primary mask (default 0.2)')
 
     # Distance & performance
     ap.add_argument('-d', '--distance', type=float, default=0.5, help='NN distance threshold (m) for a good B match')
@@ -433,8 +436,8 @@ def main():
         args.workers = psutil.cpu_count(logical=True) // args.threads   
     print(f"Using {args.workers} worker threads for A files, {args.threads} threads for KD queries.")
 
-    a_files = list_point_files(args.current_folder)
-    b_files = list_point_files(args.existing_folder)
+    a_files = list_point_files(args.input_folder)
+    b_files = list_point_files(args.mask_dir)
     if not a_files:
         raise SystemExit('No current (A) files found')
     if not b_files:
@@ -515,7 +518,8 @@ def main():
         a_base = compute_base_xy(a_xyz_sample, a_hag, base_low, base_high, fallback_percent=args.fallback_percent)
         if not np.isfinite(a_base).all():
             a_base = np.mean(a_xyz_sample[:,:2], axis=0)
-        primary_idx, candidates = choose_primary_and_candidates(a_base, ref_base_kd, len(ref_list), args.gate, args.k_alt)
+        primary_idx, candidates = choose_primary_and_candidates(
+            a_base, ref_base_kd, len(ref_list), args.gate, args.k_alt, args.primary_max_distance)
         
         if primary_idx is None:
             # No confident primary B for this A: pass file through unchanged.
