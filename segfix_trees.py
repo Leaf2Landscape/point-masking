@@ -1,56 +1,50 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-seg_mask_from_existing_stream.py
-================================
+segfix_trees.py
+===============
 
-Streaming, bbox-filtered, single-phase writer that merges **existing (B)** tree masks
-with **current (A)** points using the *fast* processing logic you provided:
+Streaming, overlap-driven assignment for target-tree point clouds against mask point clouds.
 
-- **Match A→B by base proximity** (HAG slice). For each A tree select a **primary B**
-  (nearest base). Also consider a small set of nearby B candidates (`--k-alt`) for
-  possible reassignment.
-- For each A point chunk:
-  1) **Primary-first**: try NN to the primary B cloud using `distance_upper_bound`.
-  2) For points that failed primary, try **alternative B candidates** and assign to the
-     closest that satisfies the threshold; otherwise, fall back to the primary.
-  3) Use **expanded B bboxes** to cull NN queries (fast reject), just like your script.
-- **Outputs (one per B, split by confidence)**: we **add B's own points** *and* the assigned A points into
-   separate PLY streams per confidence tier:
-   - `{tree}_matched.ply` — match_flag=1 (high confidence, near B)
-   - `{tree}_uncertain.ply` — match_flag=0 (fallback to primary, far from any B)
-   Per-vertex fields: `(x, y, z, current_id, match_flag, src)`:
-    - `current_id`: integer id of the source A file
-    - `match_flag`: 1 if A∩B (matched to some candidate); 0 if A-only (fallback to primary)
-    - `src`: 1 for A points (B core points are in separate handling)
+Workflow:
+- Build an expanded bounding box for every mask (expanded by `--distance`).
+- For each target tree, gather candidate masks using only bbox overlap.
+- For each target point, assign it to the closest candidate mask.
+- Mark point confidence by distance to that closest mask:
+    - `match_flag=1` if distance <= `--distance` (matched)
+    - `match_flag=0` if distance > `--distance` (uncertain)
 
-This creates high-confidence matched outputs (tier 1) separated from fallback-uncertain 
-outputs (tier 2) for staged manual review. Unassigned current files are copied through unchanged.
+Outputs:
+- One matched and one uncertain PLY per mask:
+    - `{mask}_matched.ply`
+    - `{mask}_uncertain.ply`
+- Per-vertex fields: `(x, y, z, current_id, match_flag, src)`
+    - `current_id`: integer id of source target file
+    - `match_flag`: matched vs uncertain by radius
+    - `src`: always `1` for target points
 
-The writer is a **single-phase appender** (no memmap stitching, no temporary .npy chunks),
-so I/O is minimal and RAM stays flat. LAS/LAZ reading is chunked via laspy; PLY/A reading
+Target files with no overlapping masks are copied through unchanged so points are not lost.
+
+The writer is a single-phase appender (no memmap stitching, no temporary `.npy` chunks),
+so I/O is minimal and RAM stays flat. LAS/LAZ reading is chunked via laspy; PLY reading
 uses array slicing in chunks.
 
 Requirements:
   pip install numpy scipy plyfile laspy tqdm
 
 Usage:
-  python seg_mask_from_existing_stream.py \
-        /path/to/trees_to_correct \
-        -m /path/to/correct_masks \
-    -o /path/to/output \
-    --gate 1.5 \
-    --base-slice 0.10 0.40 \
-    --hag-percentile 0.02 \
-    --distance 1.0 \
-    --k-alt 5 \
-    --chunk-size 500000 \
-    --workers 1
+    python segfix_trees.py \
+                /path/to/target_trees \
+                -m /path/to/masks \
+                -o /path/to/output \
+                --distance 1.0 \
+                --chunk-size 500000 \
+                --workers 1
 
 Notes:
-- This script writes **PLY** outputs to support the extra per-vertex fields cleanly.
-- Set `--workers` to 1 when running many A files sequentially; if you avoid multiprocessing,
-  you can bump it (SciPy parallelizes inside KD queries). Avoid mixing both.
+- This script writes **PLY** outputs to support extra per-vertex fields cleanly.
+- Set `--workers` to 1 when running many files sequentially; if you avoid multiprocessing,
+  you can raise it (SciPy parallelizes inside KD queries). Avoid oversubscribing CPUs.
 """
 
 from __future__ import annotations
@@ -252,9 +246,13 @@ class TreeInfo:
     base_xy: np.ndarray
     z0: float
     hag: np.ndarray
+    total_height: float = np.nan
+    dbh: float = np.nan
+    dbh_point_count: int = 0
+    align_xyz: Optional[np.ndarray] = None
 
 @dataclass
-class RefTree(TreeInfo):
+class MaskInfo(TreeInfo):
     kd: Optional[cKDTree] = None
 
 
@@ -264,6 +262,92 @@ def estimate_hag(xyz: np.ndarray, percentile: float) -> Tuple[np.ndarray, float]
     z = xyz[:,2]
     z0 = float(np.quantile(z, percentile))
     return (z - z0).astype(np.float32, copy=False), z0
+
+
+def compute_total_height(xyz: np.ndarray) -> float:
+    if xyz.size == 0:
+        return np.nan
+    return float(np.max(xyz[:,2]) - np.min(xyz[:,2]))
+
+
+def compute_dbh(xyz: np.ndarray, hag: np.ndarray,
+                breast_height: float, breast_band: float,
+                min_pts: int = 12) -> Tuple[float, int, Optional[np.ndarray]]:
+    if xyz.size == 0 or hag.size == 0:
+        return np.nan, 0, None
+
+    sel = np.abs(hag - breast_height) <= breast_band
+    pts = xyz[sel]
+    if pts.shape[0] < min_pts:
+        return np.nan, int(pts.shape[0]), None
+
+    centroid = np.mean(pts, axis=0).astype(np.float32, copy=False)
+    radial = np.linalg.norm(pts[:,:2] - centroid[:2], axis=1)
+    if radial.size == 0:
+        return np.nan, int(pts.shape[0]), centroid
+
+    dbh = float(2.0 * np.quantile(radial, 0.9))
+    return dbh, int(pts.shape[0]), centroid
+
+
+def compute_alignment_centroid(xyz: np.ndarray, hag: np.ndarray,
+                               z0: float,
+                               base_low: float, base_high: float,
+                               breast_height: float, breast_band: float,
+                               fallback_percent: float,
+                               min_breast_pts: int = 12,
+                               min_base_pts: int = 30) -> np.ndarray:
+    dbh, dbh_count, breast_centroid = compute_dbh(
+        xyz, hag, breast_height=breast_height, breast_band=breast_band, min_pts=min_breast_pts
+    )
+    if dbh_count >= min_breast_pts and breast_centroid is not None and np.isfinite(dbh):
+        return breast_centroid.astype(np.float32, copy=False)
+
+    base_sel = (hag >= base_low) & (hag <= base_high)
+    base_pts = xyz[base_sel]
+    if base_pts.shape[0] >= min_base_pts:
+        return np.mean(base_pts, axis=0).astype(np.float32, copy=False)
+
+    if xyz.shape[0] == 0:
+        return np.array([np.nan, np.nan, np.nan], dtype=np.float32)
+
+    z = xyz[:,2]
+    thr = np.quantile(z, fallback_percent)
+    low_pts = xyz[z <= thr]
+    if low_pts.shape[0] == 0:
+        low_pts = xyz
+    return np.mean(low_pts, axis=0).astype(np.float32, copy=False)
+
+
+def build_tree_info(name: str,
+                    path: Path,
+                    xyz: np.ndarray,
+                    hag_percentile: float,
+                    base_low: float,
+                    base_high: float,
+                    fallback_percent: float,
+                    dbh_height: float,
+                    dbh_band_width: float,
+                    dbh_min_points: int) -> TreeInfo:
+    hag, z0 = estimate_hag(xyz, hag_percentile)
+    base_xy = compute_base_xy(xyz, hag, base_low, base_high, fallback_percent=fallback_percent)
+    total_height = compute_total_height(xyz)
+    dbh, dbh_point_count, _ = compute_dbh(xyz, hag, dbh_height, dbh_band_width, dbh_min_points)
+    align_xyz = compute_alignment_centroid(
+        xyz, hag, z0, base_low, base_high, dbh_height, dbh_band_width, fallback_percent, dbh_min_points
+    )
+    return TreeInfo(
+        name=name,
+        path=path,
+        xyz=xyz,
+        base_xy=base_xy,
+        z0=z0,
+        hag=hag,
+        total_height=total_height,
+        dbh=dbh,
+        dbh_point_count=dbh_point_count,
+        align_xyz=align_xyz,
+    )
 
 
 def compute_base_xy(xyz: np.ndarray, hag: np.ndarray,
@@ -283,24 +367,48 @@ def compute_base_xy(xyz: np.ndarray, hag: np.ndarray,
     return np.mean(pts[:,:2], axis=0).astype(np.float32, copy=False)
 
 
-def build_ref_index(ref_paths: List[Path], hag_percentile: float,
-                    base_low: float, base_high: float,
-                    fallback_percent: float,
-                    distance: float,
-                    verbose: bool = True) -> Tuple[List[RefTree], cKDTree, List[Tuple[np.ndarray,np.ndarray]]]:
-    ref_list: List[RefTree] = []
+def build_mask_index(mask_paths: List[Path], hag_percentile: float,
+                     base_low: float, base_high: float,
+                     fallback_percent: float,
+                     dbh_height: float,
+                     dbh_band_width: float,
+                     dbh_min_points: int,
+                     distance: float,
+                     verbose: bool = True) -> Tuple[List[MaskInfo], List[Tuple[np.ndarray,np.ndarray]]]:
+    mask_list: List[MaskInfo] = []
     bases: List[np.ndarray] = []
     bboxes: List[Tuple[np.ndarray,np.ndarray]] = []
-    it = ref_paths
+    it = mask_paths
     if verbose:
-        it = tqdm(it, desc='Loading existing (B) trees', unit='tree')
+        it = tqdm(it, desc='Loading masks', unit='mask')
     for p in it:
         xyz = read_xyz(p)
-        hag, z0 = estimate_hag(xyz, hag_percentile)
-        base_xy = compute_base_xy(xyz, hag, base_low, base_high, fallback_percent=fallback_percent)
-        ref = RefTree(name=p.stem, path=p, xyz=xyz, base_xy=base_xy, z0=z0, hag=hag)
-        ref_list.append(ref)
-        bases.append(base_xy)
+        tree = build_tree_info(
+            name=p.stem,
+            path=p,
+            xyz=xyz,
+            hag_percentile=hag_percentile,
+            base_low=base_low,
+            base_high=base_high,
+            fallback_percent=fallback_percent,
+            dbh_height=dbh_height,
+            dbh_band_width=dbh_band_width,
+            dbh_min_points=dbh_min_points,
+        )
+        mask = MaskInfo(
+            name=tree.name,
+            path=tree.path,
+            xyz=tree.xyz,
+            base_xy=tree.base_xy,
+            z0=tree.z0,
+            hag=tree.hag,
+            total_height=tree.total_height,
+            dbh=tree.dbh,
+            dbh_point_count=tree.dbh_point_count,
+            align_xyz=tree.align_xyz,
+        )
+        mask_list.append(mask)
+        bases.append(mask.base_xy)
         if xyz.size == 0:
             mins = np.array([np.inf, np.inf, np.inf], dtype=np.float32)
             maxs = np.array([-np.inf, -np.inf, -np.inf], dtype=np.float32)
@@ -308,116 +416,78 @@ def build_ref_index(ref_paths: List[Path], hag_percentile: float,
             mins = xyz.min(axis=0) - distance
             maxs = xyz.max(axis=0) + distance
         bboxes.append((mins.astype(np.float32), maxs.astype(np.float32)))
-    if len(ref_list) == 0:
-        raise SystemExit('No usable existing (B) references.')
-    bases_arr = np.asarray(bases, dtype=np.float32)
-    kd = cKDTree(bases_arr)
-    return ref_list, kd, bboxes
+    if len(mask_list) == 0:
+        raise SystemExit('No usable masks found.')
+    return mask_list, bboxes
 
 
-def ensure_ref_kd(ref: RefTree) -> cKDTree:
-    if ref.kd is None:
-        pts = ref.xyz if ref.xyz.size > 0 else np.zeros((1,3), dtype=np.float32)
-        ref.kd = cKDTree(pts, leafsize=64, compact_nodes=True, balanced_tree=True)
-    return ref.kd
-
-# ---------------- Assignment with bbox + primary-first ----------------
-
-def choose_primary_and_candidates(a_base: np.ndarray, ref_base_kd: cKDTree, total_b: int,
-                                  gate: float, k_alt: int,
-                                  primary_max_distance: float = 0.2) -> Tuple[int, List[int]]:
-    d, primary_idx = ref_base_kd.query(a_base, k=1)
-    if d > primary_max_distance:
-        primary_idx = None
-    else:
-        primary_idx = int(primary_idx)
-
-    within = ref_base_kd.query_ball_point(a_base, r=gate) if gate > 0 else []
-    if len(within) == 0:
-        k = total_b if (k_alt is not None and k_alt <= 0) else min(max(1,k_alt), total_b)
-        _, knn = ref_base_kd.query(a_base, k=k)
-        if np.isscalar(knn):
-            cands = [int(knn)]
-        else:
-            cands = [int(i) for i in np.atleast_1d(knn).tolist()]
-    else:
-        cands = [int(i) for i in within]
-    if primary_idx not in cands and primary_idx is not None:
-        cands = [int(primary_idx)] + cands
-    elif primary_idx is None:
-        pass
-    else:
-        cands = [int(primary_idx)] + [i for i in cands if i != int(primary_idx)]
-
-    return primary_idx, cands
+def ensure_mask_kd(mask: MaskInfo) -> cKDTree:
+    if mask.kd is None:
+        pts = mask.xyz if mask.xyz.size > 0 else np.zeros((1,3), dtype=np.float32)
+        mask.kd = cKDTree(pts, leafsize=64, compact_nodes=True, balanced_tree=True)
+    return mask.kd
 
 
-def assign_chunk_primary_then_alts(a_xyz: np.ndarray, primary_idx: int, candidates: List[int],
-                                   ref_list: List[RefTree], bboxes: List[Tuple[np.ndarray,np.ndarray]],
-                                   distance: float, workers: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Assign a chunk of A points: try primary first (with bbox+upper_bound), then alternatives.
-    Returns (assigned_b, match_flag)."""
+def assign_chunk_to_closest_mask(a_xyz: np.ndarray,
+                                 candidates: List[int],
+                                 mask_list: List[MaskInfo],
+                                 distance: float,
+                                 workers: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Assign each target point to its closest candidate mask.
+    Points within `distance` are matched (1), otherwise uncertain (0)."""
     n = a_xyz.shape[0]
-    assigned_b = np.full(n, primary_idx, dtype=np.int64)  # default fallback: primary
+    assigned_mask = np.full(n, -1, dtype=np.int64)
     match_flag = np.zeros(n, dtype=np.int32)
+    if n == 0 or not candidates:
+        return assigned_mask, match_flag
 
-    # Try all candidates and assign each point to the closest
     best_dist = np.full(n, np.inf, dtype=np.float32)
-    best_b = np.full(n, primary_idx, dtype=np.int64)
+    best_mask = np.full(n, -1, dtype=np.int64)
 
-    for bidx in candidates:
-        mins, maxs = bboxes[bidx]
-        in_box = np.all((a_xyz >= mins) & (a_xyz <= maxs), axis=1)
-        if not np.any(in_box):
-            continue
-        sub_idx = np.where(in_box)[0]
-        sub_pts = a_xyz[sub_idx]
-        d, _ = ensure_ref_kd(ref_list[bidx]).query(sub_pts, k=1, distance_upper_bound=distance, workers=workers)
-        ok = (d != np.inf)
-        if not np.any(ok):
-            continue
-        ok_idx = sub_idx[ok]
-        dists = d[ok]
-        better = dists < best_dist[ok_idx]
+    for midx in candidates:
+        d, _ = ensure_mask_kd(mask_list[midx]).query(a_xyz, k=1, workers=workers)
+        better = d < best_dist
         if np.any(better):
-            take = ok_idx[better]
-            best_dist[take] = dists[better]
-            best_b[take] = bidx
+            best_dist[better] = d[better]
+            best_mask[better] = midx
 
-    matched = best_dist != np.inf
-    assigned_b[:] = best_b
-    match_flag[matched] = 1
-    match_flag[~matched] = 0
+    assigned_mask[:] = best_mask
+    match_flag[best_dist <= distance] = 1
+    match_flag[best_dist > distance] = 0
+    return assigned_mask, match_flag
 
-    return assigned_b, match_flag
+
+def find_overlapping_bboxes(a_mins: np.ndarray, a_maxs: np.ndarray,
+                            bboxes: List[Tuple[np.ndarray, np.ndarray]]) -> List[int]:
+    """Return B indices whose bbox intersects the A bbox."""
+    overlaps: List[int] = []
+    for bidx, (b_mins, b_maxs) in enumerate(bboxes):
+        if np.all(a_maxs >= b_mins) and np.all(a_mins <= b_maxs):
+            overlaps.append(bidx)
+    return overlaps
 
 # ---------------- Main ----------------
 
 def main():
-    ap = argparse.ArgumentParser(description='Streaming A→B merge that writes one PLY per B with B core + assigned A points.')
-    ap.add_argument('input_folder', type=Path, help='Folder of trees to correct / mask (.ply/.las/.laz)')
-    ap.add_argument('-m', '--mask_dir', type=Path, required=True, help='Folder of correct masks to use (.ply/.las/.laz)')
-    ap.add_argument('-o', '--output', type=Path, required=True, help='Output folder for per-B PLY files')
-    ap.add_argument('-scf', '--save-current-filename', action='store_true', help='Rename the saved output files to the majority contributing current_id filename')
+    ap = argparse.ArgumentParser(description='Streaming target-tree to mask assignment using overlap-only mask candidates.')
+    ap.add_argument('input_folder', type=Path, help='Folder of target tree files (.ply/.las/.laz)')
+    ap.add_argument('-m', '--mask_dir', type=Path, required=True, help='Folder of mask files (.ply/.las/.laz)')
+    ap.add_argument('-o', '--output', type=Path, required=True, help='Output folder for per-mask PLY files')
+    ap.add_argument('-stf', '--save-target-filename', dest='save_target_filename', action='store_true',
+                    help='Rename saved outputs to majority contributing target filename')
 
-    # HAG & base
     ap.add_argument('--hag-percentile', type=float, default=0.02, help='Percentile of z as ground (default 0.02)')
-    ap.add_argument('--base-slice', type=float, nargs=2, default=[0.10, 0.40], metavar=('LOW','HIGH'), help='HAG slice for base centroid')
-    ap.add_argument('--fallback-percent', type=float, default=0.05, help='Fallback lowest proportion when base slice sparse')
+    ap.add_argument('--base-slice', type=float, nargs=2, default=[0.10, 0.40], metavar=('LOW', 'HIGH'), help='HAG slice used for summary metrics')
+    ap.add_argument('--fallback-percent', type=float, default=0.05, help='Fallback lowest proportion when base slice is sparse')
+    ap.add_argument('--dbh-height', type=float, default=1.3, help='Height above ground for DBH summary metric (m)')
+    ap.add_argument('--dbh-band-width', type=float, default=0.2, help='Half-width of DBH sampling band (m)')
+    ap.add_argument('--dbh-min-points', type=int, default=12, help='Minimum points required in DBH band')
 
-    # Matching
-    ap.add_argument('--gate', type=float, default=1.5, help='Base-XY gating radius for B candidates')
-    ap.add_argument('--k-alt', type=int, default=5, help='If no within-gate, use k nearest Bs (<=0 → all)')
-    ap.add_argument('--primary-max-distance', type=float, default=0.2,
-                    help='Maximum base distance (m) allowed for selecting a primary mask (default 0.2)')
+    ap.add_argument('-d', '--distance', type=float, default=0.5, help='Match radius (m): points inside are matched, outside are uncertain')
+    ap.add_argument('--chunk-size', type=int, default=500000, help='Points per chunk for target files')
+    ap.add_argument('--workers', type=int, default=None, help='Threads for processing target files in parallel (default: physical CPUs)')
+    ap.add_argument('--threads', type=int, default=None, help='Threads for KD queries (default: logical CPUs / workers)')
 
-    # Distance & performance
-    ap.add_argument('-d', '--distance', type=float, default=0.5, help='NN distance threshold (m) for a good B match')
-    ap.add_argument('--chunk-size', type=int, default=500000, help='Points per chunk for A')
-    ap.add_argument('--workers', type=int, default=None, help='Threads for processing A files in parallel (default 1, set >1 to parallelize across A files). Default physical cpus')
-    ap.add_argument('--threads', type=int, default=None, help='Threads for KD queries inside SciPy (pick 1 if you parallelize elsewhere). Default logical cores - physical cpus')
-
-    # Report
     ap.add_argument('--report', type=Path, default=None, help='Optional CSV report path (default: output/merge_report.csv)')
 
     args = ap.parse_args()
@@ -425,69 +495,70 @@ def main():
     out_dir = args.output
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Set workers
     if args.workers is None:
         import psutil
         args.workers = psutil.cpu_count(logical=False)
     if args.threads is None:
         import psutil
-        args.threads = psutil.cpu_count(logical=True) // args.workers
-    else:
-        args.workers = psutil.cpu_count(logical=True) // args.threads   
-    print(f"Using {args.workers} worker threads for A files, {args.threads} threads for KD queries.")
+        args.threads = max(1, psutil.cpu_count(logical=True) // max(1, args.workers))
+    print(f"Using {args.workers} worker threads for target files, {args.threads} threads for KD queries.")
 
-    a_files = list_point_files(args.input_folder)
-    b_files = list_point_files(args.mask_dir)
-    if not a_files:
-        raise SystemExit('No current (A) files found')
-    if not b_files:
-        raise SystemExit('No existing (B) files found')
+    target_files = list_point_files(args.input_folder)
+    mask_files = list_point_files(args.mask_dir)
+    if not target_files:
+        raise SystemExit('No target tree files found')
+    if not mask_files:
+        raise SystemExit('No mask files found')
 
     base_low, base_high = args.base_slice
 
-    # Build B index + bboxes
-    ref_list, ref_base_kd, bboxes = build_ref_index(
-        b_files, args.hag_percentile, base_low, base_high, args.fallback_percent, args.distance, verbose=True
+    mask_list, bboxes = build_mask_index(
+        mask_files,
+        args.hag_percentile,
+        base_low,
+        base_high,
+        args.fallback_percent,
+        args.dbh_height,
+        args.dbh_band_width,
+        args.dbh_min_points,
+        args.distance,
+        verbose=True,
     )
 
-    passthrough_fields = infer_passthrough_fields(a_files)
+    passthrough_fields = infer_passthrough_fields(target_files)
     if passthrough_fields:
         print('Passthrough fields:', ', '.join(name for name, _ in passthrough_fields))
     else:
         print('Passthrough fields: none')
 
-    # Structured dtype for output
     out_dtype_fields: List[Tuple[str, str]] = [
-        ('x','<f4'), ('y','<f4'), ('z','<f4'),
-        ('current_id','<i4'), ('match_flag','<i4'), ('src','<i4')
+        ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+        ('current_id', '<i4'), ('match_flag', '<i4'), ('src', '<i4')
     ]
     out_dtype_fields.extend((name, str(dt)) for name, dt in passthrough_fields)
     out_dtype = np.dtype(out_dtype_fields)
 
-    # Two appenders per B: matched and uncertain tiers
     appenders_matched: List[PlyStructAppender] = []
     appenders_uncertain: List[PlyStructAppender] = []
-    counts_matched = np.zeros((len(ref_list),), dtype=np.int64)
-    counts_uncertain = np.zeros((len(ref_list),), dtype=np.int64)
-    for bidx, ref in enumerate(ref_list):
-        app_m = PlyStructAppender(out_dir / f"{ref.name}_matched.ply", out_dtype)
-        app_u = PlyStructAppender(out_dir / f"{ref.name}_uncertain.ply", out_dtype)
+    counts_matched = np.zeros((len(mask_list),), dtype=np.int64)
+    counts_uncertain = np.zeros((len(mask_list),), dtype=np.int64)
+    for midx, mask in enumerate(mask_list):
+        app_m = PlyStructAppender(out_dir / f"{mask.name}_matched.ply", out_dtype)
+        app_u = PlyStructAppender(out_dir / f"{mask.name}_uncertain.ply", out_dtype)
         appenders_matched.append(app_m)
         appenders_uncertain.append(app_u)
 
-    # current_id to filename mapping
-    rct_id_map: Dict[int, str] = {}
-    for idx, a_path in enumerate(a_files, start=1):
-        rct_id_map[idx] = a_path.name
+    target_id_map: Dict[int, str] = {}
+    for idx, target_path in enumerate(target_files, start=1):
+        target_id_map[idx] = target_path.name
 
-    print(f'Processing {len(a_files)} current (A) masks ...')
+    print(f'Processing {len(target_files)} target trees ...')
     passthrough_copied = 0
-    
-    def process_a_file(a_path):
-        """Process a single A file and return results to accumulate."""
-        ext = a_path.suffix.lower()
-        cid = next(k for k, v in rct_id_map.items() if v == a_path.name)
+    link_rows: List[List[object]] = []
 
+    def process_target_file(target_path: Path):
+        ext = target_path.suffix.lower()
+        target_id = next(k for k, v in target_id_map.items() if v == target_path.name)
         passthrough_names = [name for name, _ in passthrough_fields]
 
         def convert_passthrough_chunk(chunk_data: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
@@ -498,54 +569,92 @@ def main():
                     continue
                 out[name] = np.asarray(vals).astype(out_dt, copy=False)
             return out
-        
-        # Load base for this A
-        if ext in ('.las','.laz'):
-            with laspy.open(a_path) as src:
+
+        if ext in ('.las', '.laz'):
+            with laspy.open(target_path) as src:
                 n = min(int(src.header.point_count), 1000000)
                 it = src.chunk_iterator(n)
                 first = next(it)
-                a_xyz_sample = np.vstack((first.x, first.y, first.z)).T.astype(np.float32, copy=False)
+                target_xyz_sample = np.vstack((first.x, first.y, first.z)).T.astype(np.float32, copy=False)
+                target_bbox_mins = np.asarray(src.header.mins, dtype=np.float32)
+                target_bbox_maxs = np.asarray(src.header.maxs, dtype=np.float32)
         elif ext == '.ply':
-            with open(a_path, 'rb') as f:
+            with open(target_path, 'rb') as f:
                 ply = PlyData.read(f)
             v = ply['vertex']
-            a_xyz_sample = np.vstack((v['x'], v['y'], v['z'])).T.astype(np.float32, copy=False)
+            target_xyz_sample = np.vstack((v['x'], v['y'], v['z'])).T.astype(np.float32, copy=False)
+            if target_xyz_sample.shape[0] > 0:
+                target_bbox_mins = np.min(target_xyz_sample, axis=0)
+                target_bbox_maxs = np.max(target_xyz_sample, axis=0)
+            else:
+                target_bbox_mins = np.array([np.inf, np.inf, np.inf], dtype=np.float32)
+                target_bbox_maxs = np.array([-np.inf, -np.inf, -np.inf], dtype=np.float32)
         else:
-            return {'mode': 'skip', 'cid': cid, 'path': a_path}
-        
-        a_hag, _ = estimate_hag(a_xyz_sample, args.hag_percentile)
-        a_base = compute_base_xy(a_xyz_sample, a_hag, base_low, base_high, fallback_percent=args.fallback_percent)
-        if not np.isfinite(a_base).all():
-            a_base = np.mean(a_xyz_sample[:,:2], axis=0)
-        primary_idx, candidates = choose_primary_and_candidates(
-            a_base, ref_base_kd, len(ref_list), args.gate, args.k_alt, args.primary_max_distance)
-        
-        if primary_idx is None:
-            # No confident primary B for this A: pass file through unchanged.
-            return {'mode': 'copy_passthrough', 'cid': cid, 'path': a_path}
+            return {'mode': 'skip', 'target_id': target_id, 'path': target_path}
 
-        # Collect results: (bidx, pts, match_flag)
-        results = [[] for _ in range(len(ref_list))]
-        
-        if ext in ('.las','.laz'):
-            with laspy.open(a_path) as src:
+        target_tree = build_tree_info(
+            name=target_path.stem,
+            path=target_path,
+            xyz=target_xyz_sample,
+            hag_percentile=args.hag_percentile,
+            base_low=base_low,
+            base_high=base_high,
+            fallback_percent=args.fallback_percent,
+            dbh_height=args.dbh_height,
+            dbh_band_width=args.dbh_band_width,
+            dbh_min_points=args.dbh_min_points,
+        )
+
+        candidate_masks = find_overlapping_bboxes(target_bbox_mins, target_bbox_maxs, bboxes)
+        if not candidate_masks:
+            return {
+                'mode': 'copy_passthrough',
+                'target_id': target_id,
+                'path': target_path,
+                'link_row': [
+                    target_path.name,
+                    '',
+                    0,
+                    0,
+                    0,
+                    '',
+                    float(target_tree.dbh) if np.isfinite(target_tree.dbh) else '',
+                    float(target_tree.total_height) if np.isfinite(target_tree.total_height) else '',
+                    'no_overlapping_masks',
+                ],
+            }
+
+        results = [[] for _ in range(len(mask_list))]
+        matched_counts: Dict[int, int] = {midx: 0 for midx in candidate_masks}
+        assigned_counts: Dict[int, int] = {midx: 0 for midx in candidate_masks}
+        total_matched = 0
+        total_uncertain = 0
+
+        if ext in ('.las', '.laz'):
+            with laspy.open(target_path) as src:
                 for chunk in src.chunk_iterator(args.chunk_size):
                     chunk_xyz = np.vstack((chunk.x, chunk.y, chunk.z)).T.astype(np.float32, copy=False)
                     passthrough_chunk = convert_passthrough_chunk({
                         name: np.asarray(getattr(chunk, name)) for name in passthrough_names if hasattr(chunk, name)
                     })
-                    assigned_b, match_flag = assign_chunk_primary_then_alts(
-                        chunk_xyz, primary_idx, candidates, ref_list, bboxes, args.distance, args.threads)
-                    for bidx in np.unique(assigned_b):
-                        sel = (assigned_b == bidx)
-                        results[bidx].append((
+                    assigned_mask, match_flag = assign_chunk_to_closest_mask(
+                        chunk_xyz, candidate_masks, mask_list, args.distance, args.threads
+                    )
+                    total_matched += int((match_flag == 1).sum())
+                    total_uncertain += int((match_flag == 0).sum())
+                    for midx in np.unique(assigned_mask[assigned_mask >= 0]):
+                        sel = (assigned_mask == midx)
+                        assigned_counts[int(midx)] = assigned_counts.get(int(midx), 0) + int(sel.sum())
+                        msel = sel & (match_flag == 1)
+                        if np.any(msel):
+                            matched_counts[int(midx)] = matched_counts.get(int(midx), 0) + int(msel.sum())
+                        results[midx].append((
                             chunk_xyz[sel],
                             match_flag[sel],
                             {name: vals[sel] for name, vals in passthrough_chunk.items()}
                         ))
-        else:  # PLY
-            with open(a_path, 'rb') as f:
+        else:
+            with open(target_path, 'rb') as f:
                 v = PlyData.read(f)['vertex']
             pts = np.vstack((v['x'], v['y'], v['z'])).T.astype(np.float32, copy=False)
             for s in range(0, pts.shape[0], args.chunk_size):
@@ -554,25 +663,64 @@ def main():
                 passthrough_chunk = convert_passthrough_chunk({
                     name: np.asarray(v[name][s:e]) for name in passthrough_names if name in v.data.dtype.names
                 })
-                assigned_b, match_flag = assign_chunk_primary_then_alts(
-                    chunk_xyz, primary_idx, candidates, ref_list, bboxes, args.distance, args.threads)
-                for bidx in np.unique(assigned_b):
-                    sel = (assigned_b == bidx)
-                    results[bidx].append((
+                assigned_mask, match_flag = assign_chunk_to_closest_mask(
+                    chunk_xyz, candidate_masks, mask_list, args.distance, args.threads
+                )
+                total_matched += int((match_flag == 1).sum())
+                total_uncertain += int((match_flag == 0).sum())
+                for midx in np.unique(assigned_mask[assigned_mask >= 0]):
+                    sel = (assigned_mask == midx)
+                    assigned_counts[int(midx)] = assigned_counts.get(int(midx), 0) + int(sel.sum())
+                    msel = sel & (match_flag == 1)
+                    if np.any(msel):
+                        matched_counts[int(midx)] = matched_counts.get(int(midx), 0) + int(msel.sum())
+                    results[midx].append((
                         chunk_xyz[sel],
                         match_flag[sel],
                         {name: vals[sel] for name, vals in passthrough_chunk.items()}
                     ))
-        
-        return {'mode': 'assigned', 'cid': cid, 'results': results}
-    
-    # Track current_ids per existing mask with point counts per current_id
-    current_ids_per_b: List[Dict[int, int]] = [{} for _ in range(len(ref_list))]
-    
-    # Process A files in parallel
+
+        if total_matched == 0 and total_uncertain == 0:
+            return {
+                'mode': 'copy_passthrough',
+                'target_id': target_id,
+                'path': target_path,
+                'link_row': [
+                    target_path.name,
+                    '',
+                    len(candidate_masks),
+                    0,
+                    0,
+                    '',
+                    float(target_tree.dbh) if np.isfinite(target_tree.dbh) else '',
+                    float(target_tree.total_height) if np.isfinite(target_tree.total_height) else '',
+                    'empty_target',
+                ],
+            }
+
+        selected_mask_idx = max(candidate_masks, key=lambda midx: (assigned_counts.get(midx, 0), matched_counts.get(midx, 0), -midx))
+        matched_summary = ';'.join(
+            f"{mask_list[midx].name}:{matched_counts.get(midx, 0)}"
+            for midx in sorted(candidate_masks, key=lambda i: (-matched_counts.get(i, 0), i))
+        )
+        link_row = [
+            target_path.name,
+            mask_list[selected_mask_idx].name,
+            len(candidate_masks),
+            total_matched,
+            total_uncertain,
+            matched_summary,
+            float(target_tree.dbh) if np.isfinite(target_tree.dbh) else '',
+            float(target_tree.total_height) if np.isfinite(target_tree.total_height) else '',
+            'assigned',
+        ]
+        return {'mode': 'assigned', 'target_id': target_id, 'results': results, 'link_row': link_row}
+
+    current_ids_per_mask: List[Dict[int, int]] = [{} for _ in range(len(mask_list))]
+
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = {executor.submit(process_a_file, p): p for p in a_files}
-        for future in tqdm(as_completed(futures), total=len(a_files), desc='Assigning A→B', unit='mask'):
+        futures = {executor.submit(process_target_file, p): p for p in target_files}
+        for future in tqdm(as_completed(futures), total=len(target_files), desc='Assigning target trees to masks', unit='tree'):
             result = future.result()
             if result is None:
                 continue
@@ -583,44 +731,45 @@ def main():
                 dst_path = out_dir / src_path.name
                 shutil.copy2(src_path, dst_path)
                 passthrough_copied += 1
+                link_row = result.get('link_row')
+                if link_row is not None:
+                    link_rows.append(link_row)
                 continue
 
             if mode != 'assigned':
                 continue
 
-            cid = result.get('cid')
+            target_id = result.get('target_id')
             results = result.get('results')
-            if cid is None or results is None:
+            link_row = result.get('link_row')
+            if target_id is None or results is None:
                 continue
-            for bidx, chunks in enumerate(results):
-                if len(chunks) > 0:
-                    if cid not in current_ids_per_b[bidx]:
-                        current_ids_per_b[bidx][cid] = 0
+            if link_row is not None:
+                link_rows.append(link_row)
+            for midx, chunks in enumerate(results):
+                if len(chunks) > 0 and target_id not in current_ids_per_mask[midx]:
+                    current_ids_per_mask[midx][target_id] = 0
                 for pts, mflags, passthrough_chunk in chunks:
                     if pts.shape[0] == 0:
                         continue
                     recs = np.zeros(pts.shape[0], dtype=out_dtype)
-                    recs['x'], recs['y'], recs['z'] = pts[:,0], pts[:,1], pts[:,2]
-                    recs['current_id'][:] = cid
+                    recs['x'], recs['y'], recs['z'] = pts[:, 0], pts[:, 1], pts[:, 2]
+                    recs['current_id'][:] = target_id
                     recs['match_flag'][:] = mflags
                     recs['src'][:] = 1
                     for name, vals in passthrough_chunk.items():
                         recs[name] = vals
-                    
-                    # Split by confidence tier
+
                     matched_sel = (mflags == 1)
                     uncertain_sel = (mflags == 0)
-                    
                     if np.any(matched_sel):
-                        appenders_matched[bidx].append(recs[matched_sel])
-                        counts_matched[bidx] += int(matched_sel.sum())
+                        appenders_matched[midx].append(recs[matched_sel])
+                        counts_matched[midx] += int(matched_sel.sum())
                     if np.any(uncertain_sel):
-                        appenders_uncertain[bidx].append(recs[uncertain_sel])
-                        counts_uncertain[bidx] += int(uncertain_sel.sum())
-                    
-                    current_ids_per_b[bidx][cid] += pts.shape[0]
+                        appenders_uncertain[midx].append(recs[uncertain_sel])
+                        counts_uncertain[midx] += int(uncertain_sel.sum())
+                    current_ids_per_mask[midx][target_id] += pts.shape[0]
 
-    # Finalize all B outputs (skip empty tiers to avoid empty files)
     for app in appenders_matched:
         if app.count > 0:
             app.finalize()
@@ -632,41 +781,46 @@ def main():
         else:
             app.discard()
 
-    # current_id_map.csv
     with open(out_dir / 'current_id_map.csv', 'w', newline='') as f:
         w = csv.writer(f)
-        w.writerow(['current_id','current_filename'])
-        for cid, name in rct_id_map.items():
-            w.writerow([cid, name])
+        w.writerow(['target_id', 'target_filename'])
+        for target_id, name in target_id_map.items():
+            w.writerow([target_id, name])
 
-    # Report
+    with open(out_dir / 'link_report.csv', 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow([
+            'target_filename', 'selected_mask_name', 'overlapping_mask_count',
+            'matched_points_total', 'uncertain_points_total', 'matched_points_per_mask',
+            'target_dbh', 'target_height', 'status'
+        ])
+        w.writerows(link_rows)
+
     report_path = args.report if args.report is not None else (out_dir / 'merge_report.csv')
     with open(report_path, 'w', newline='') as f:
         w = csv.writer(f)
-        w.writerow(['existing_name', 'points_matched', 'points_uncertain', 'current_ids'])
-        for bidx, ref in enumerate(ref_list):
-            # Sort current_ids by contribution (descending)
-            sorted_cids = sorted(current_ids_per_b[bidx].items(), key=lambda x: x[1], reverse=True)
-            cid_list = ','.join(f"{cid}({count})" for cid, count in sorted_cids)
-            w.writerow([ref.name, int(counts_matched[bidx]), int(counts_uncertain[bidx]), cid_list])
+        w.writerow(['mask_name', 'points_matched', 'points_uncertain', 'target_ids'])
+        for midx, mask in enumerate(mask_list):
+            sorted_ids = sorted(current_ids_per_mask[midx].items(), key=lambda x: x[1], reverse=True)
+            id_list = ','.join(f"{target_id}({count})" for target_id, count in sorted_ids)
+            w.writerow([mask.name, int(counts_matched[midx]), int(counts_uncertain[midx]), id_list])
 
-    # If --save-current-filename, merge duplicate-majority outputs and rename by majority current filename
-    if args.save_current_filename:
+    if args.save_target_filename:
         majority_groups: Dict[str, List[int]] = {}
-        for bidx, _ref in enumerate(ref_list):
-            if len(current_ids_per_b[bidx]) == 0:
+        for midx, _mask in enumerate(mask_list):
+            if len(current_ids_per_mask[midx]) == 0:
                 continue
-            majority_cid = max(current_ids_per_b[bidx].items(), key=lambda x: x[1])[0]
-            majority_name = rct_id_map.get(majority_cid, f"current_{majority_cid}")
+            majority_target_id = max(current_ids_per_mask[midx].items(), key=lambda x: x[1])[0]
+            majority_name = target_id_map.get(majority_target_id, f"target_{majority_target_id}")
             majority_name = majority_name.replace('.ply', '').replace('.las', '').replace('.laz', '')
-            majority_groups.setdefault(majority_name, []).append(bidx)
+            majority_groups.setdefault(majority_name, []).append(midx)
 
-        for majority_name, bidx_group in majority_groups.items():
+        for majority_name, midx_group in majority_groups.items():
             for suffix in ['_matched', '_uncertain']:
                 src_paths = [
-                    out_dir / f"{ref_list[bidx].name}{suffix}.ply"
-                    for bidx in bidx_group
-                    if (out_dir / f"{ref_list[bidx].name}{suffix}.ply").exists()
+                    out_dir / f"{mask_list[midx].name}{suffix}.ply"
+                    for midx in midx_group
+                    if (out_dir / f"{mask_list[midx].name}{suffix}.ply").exists()
                 ]
                 if len(src_paths) == 0:
                     continue
@@ -696,12 +850,13 @@ def main():
                     if src.exists() and src != dst_path:
                         src.unlink()
 
-        print('Renamed/merged output files based on majority contributing current_id.')
+        print('Renamed/merged output files based on majority contributing target_id.')
 
-    print(f"Done. Wrote per-existing outputs to {out_dir}.")
+    print(f"Done. Wrote per-mask outputs to {out_dir}.")
     if passthrough_copied > 0:
-        print(f"Copied {passthrough_copied} unmatched current file(s) through to output.")
-    print(f"Current-ID map: {out_dir / 'current_id_map.csv'}")
+        print(f"Copied {passthrough_copied} target tree file(s) through to output.")
+    print(f"Target-ID map: {out_dir / 'current_id_map.csv'}")
+    print(f"Link report: {out_dir / 'link_report.csv'}")
     print(f"Report: {report_path}")
 
 if __name__ == '__main__':
