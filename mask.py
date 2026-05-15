@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import concurrent.futures
 import contextlib
 import json
 import os
@@ -14,7 +15,7 @@ import laspy
 import numpy as np
 from laspy import ExtraBytesParams, ScaleAwarePointRecord
 from plyfile import PlyData
-from scipy.spatial import ConvexHull, Delaunay, QhullError, cKDTree
+from scipy.spatial import ConvexHull, QhullError, cKDTree
 from tqdm import tqdm
 
 try:
@@ -34,7 +35,7 @@ PROGRESS_KW = {
 
 
 def stage(msg: str) -> None:
-    print(f"[mask] {msg}")
+    print(f"[mask] {msg}", flush=True)
 
 
 def normalize_cli_path(path: Path, must_exist: bool) -> Path:
@@ -138,10 +139,10 @@ def parse_mask_ids(stem: str) -> Tuple[int, int]:
 
 @dataclass
 class HullInfo:
-    tree: cKDTree
-    delaunay: Optional[Delaunay]
     mins: np.ndarray
     maxs: np.ndarray
+    A: np.ndarray
+    b: np.ndarray
 
 
 @dataclass
@@ -155,6 +156,45 @@ class MaskRecord:
     hull: Optional[HullInfo] = None
     las_out: Optional[Path] = None
     ply_out: Optional[Path] = None
+
+
+def build_mask_record(
+    tree_id: int,
+    stem_id: int,
+    point_sets: List[np.ndarray],
+    distance: float,
+    use_hull_fill: bool,
+    vox_mul: float,
+    out_dir: Path,
+    las_suffix: str,
+    fast_index_build: bool,
+) -> MaskRecord:
+    pts = np.vstack(point_sets).astype(np.float32, copy=False)
+    tree = cKDTree(
+        pts,
+        leafsize=64,
+        compact_nodes=not fast_index_build,
+        balanced_tree=not fast_index_build,
+    )
+    mins = np.min(pts, axis=0).astype(np.float32) - float(distance)
+    maxs = np.max(pts, axis=0).astype(np.float32) + float(distance)
+    key_name = f"{tree_id}_{stem_id}"
+
+    hull = None
+    if use_hull_fill:
+        hull = build_hull_info(pts, float(distance), vox_mul)
+
+    return MaskRecord(
+        tree_id=tree_id,
+        stem_id=stem_id,
+        points=pts,
+        tree=tree,
+        mins=mins,
+        maxs=maxs,
+        hull=hull,
+        las_out=out_dir / f"{key_name}{las_suffix}",
+        ply_out=out_dir / f"{key_name}.ply",
+    )
 
 
 class PlyStructAppender:
@@ -230,34 +270,12 @@ def build_hull_info(points: np.ndarray, distance: float, vox_mul: float) -> Opti
 
     mins = np.min(points, axis=0)
     vox = np.floor((points - mins) / grid).astype(np.int32)
-    z_ids = vox[:, 2]
-
-    keep_indices: List[int] = []
-    for z_val in np.unique(z_ids):
-        sel_z = z_ids == z_val
-        if not np.any(sel_z):
-            continue
-
-        pts_z = points[sel_z]
-        vox_z = vox[sel_z]
-        global_idx_z = np.where(sel_z)[0]
-        centroid_xy = np.mean(pts_z[:, :2], axis=0)
-
-        uniq, inv = np.unique(vox_z, axis=0, return_inverse=True)
-        for gid in range(uniq.shape[0]):
-            local = np.where(inv == gid)[0]
-            if local.size == 1:
-                keep_indices.append(int(global_idx_z[local[0]]))
-                continue
-            group_pts = pts_z[local]
-            radial = np.linalg.norm(group_pts[:, :2] - centroid_xy, axis=1)
-            pick_local = local[int(np.argmax(radial))]
-            keep_indices.append(int(global_idx_z[pick_local]))
-
-    if not keep_indices:
+    # One representative per voxel keeps support size bounded with low overhead.
+    _, idx = np.unique(vox, axis=0, return_index=True)
+    if idx.size == 0:
         return None
 
-    support = points[np.unique(np.asarray(keep_indices, dtype=np.int64))]
+    support = points[np.sort(idx)]
     if support.shape[0] < 4:
         return None
 
@@ -270,16 +288,15 @@ def build_hull_info(points: np.ndarray, distance: float, vox_mul: float) -> Opti
     if hull_pts.shape[0] < 4:
         return None
 
-    try:
-        delaunay = Delaunay(hull_pts, qhull_options="QJ")
-    except QhullError:
-        delaunay = None
+    # Delaunay removed: hull half-space equations enable fast vectorized membership tests.
+    A = hull.equations[:, :-1].astype(np.float32, copy=False)
+    b = hull.equations[:, -1].astype(np.float32, copy=False)
 
     return HullInfo(
-        tree=cKDTree(hull_pts, leafsize=64, compact_nodes=True, balanced_tree=True),
-        delaunay=delaunay,
         mins=np.min(hull_pts, axis=0).astype(np.float32),
         maxs=np.max(hull_pts, axis=0).astype(np.float32),
+        A=A,
+        b=b,
     )
 
 
@@ -291,6 +308,9 @@ def load_masks(
     out_dir: Path,
     las_suffix: str,
     load_chunk_size: int,
+    index_workers: int,
+    index_workers_auto: bool,
+    fast_index_build: bool,
 ) -> List[MaskRecord]:
     grouped: Dict[Tuple[int, int], List[np.ndarray]] = {}
     mask_files = list_point_files(mask_folder)
@@ -313,34 +333,140 @@ def load_masks(
     if not grouped:
         raise SystemExit("No usable mask points found.")
 
-    masks: List[MaskRecord] = []
-    for (tree_id, stem_id), point_sets in sorted(grouped.items()):
-        pts = np.vstack(point_sets).astype(np.float32, copy=False)
-        tree = cKDTree(pts, leafsize=64, compact_nodes=True, balanced_tree=True)
-        mins = np.min(pts, axis=0).astype(np.float32) - float(distance)
-        maxs = np.max(pts, axis=0).astype(np.float32) + float(distance)
-        key_name = f"{tree_id}_{stem_id}"
+    grouped_items = sorted(grouped.items())
+    total_mask_points = int(sum(sum(arr.shape[0] for arr in point_sets) for point_sets in grouped.values()))
+    stage(
+        f"Building spatial indices for {len(grouped_items)} unique mask id pair(s) "
+        f"from {total_mask_points} point(s)"
+    )
+    workers = max(1, int(index_workers))
+    workers = min(workers, len(grouped_items))
 
-        hull = None
-        if use_hull_fill:
-            hull = build_hull_info(pts, float(distance), vox_mul)
+    if index_workers_auto and workers > 1:
+        avg_points_per_mask = total_mask_points / max(1, len(grouped_items))
 
-        masks.append(
-            MaskRecord(
-                tree_id=tree_id,
-                stem_id=stem_id,
-                points=pts,
-                tree=tree,
-                mins=mins,
-                maxs=maxs,
-                hull=hull,
-                las_out=out_dir / f"{key_name}{las_suffix}",
-                ply_out=out_dir / f"{key_name}.ply",
+        # KD-tree construction is typically memory-bandwidth bound for large masks.
+        # In those cases, many build threads can be slower than serial.
+        if len(grouped_items) < 16 or avg_points_per_mask >= 500000:
+            stage(
+                "Auto index worker policy selected serial build "
+                f"(masks={len(grouped_items)}, avg_points_per_mask={int(avg_points_per_mask)})"
             )
-        )
+            workers = 1
+        else:
+            auto_cap = min(workers, 8)
+            if auto_cap != workers:
+                stage(f"Auto index worker policy capped workers to {auto_cap} to avoid oversubscription")
+            workers = auto_cap
+
+    if workers > 1:
+        stage(f"Parallel mask index build enabled with {workers} worker(s)")
+    if fast_index_build:
+        stage("Fast index build enabled (faster startup, potentially slower nearest-neighbor queries)")
+
+    masks: List[MaskRecord] = []
+    if workers == 1:
+        for (tree_id, stem_id), point_sets in tqdm(
+            grouped_items,
+            unit="mask",
+            desc="Build mask trees",
+            **PROGRESS_KW,
+        ):
+            masks.append(
+                build_mask_record(
+                    tree_id=tree_id,
+                    stem_id=stem_id,
+                    point_sets=point_sets,
+                    distance=distance,
+                    use_hull_fill=use_hull_fill,
+                    vox_mul=vox_mul,
+                    out_dir=out_dir,
+                    las_suffix=las_suffix,
+                    fast_index_build=fast_index_build,
+                )
+            )
+    else:
+        futures: Dict[concurrent.futures.Future[MaskRecord], Tuple[int, int]] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            for (tree_id, stem_id), point_sets in grouped_items:
+                fut = pool.submit(
+                    build_mask_record,
+                    tree_id,
+                    stem_id,
+                    point_sets,
+                    distance,
+                    use_hull_fill,
+                    vox_mul,
+                    out_dir,
+                    las_suffix,
+                    fast_index_build,
+                )
+                futures[fut] = (tree_id, stem_id)
+
+            for fut in tqdm(
+                concurrent.futures.as_completed(futures),
+                total=len(futures),
+                unit="mask",
+                desc="Build mask trees",
+                **PROGRESS_KW,
+            ):
+                masks.append(fut.result())
+
+        masks.sort(key=lambda m: (m.tree_id, m.stem_id))
 
     stage(f"Using {len(masks)} unique mask id pair(s)")
     return masks
+
+
+def resolve_index_workers(index_workers_raw: str) -> int:
+    if index_workers_raw is None:
+        index_workers_raw = "auto"
+    raw = str(index_workers_raw).strip().lower()
+    if raw == "auto":
+        slurm_raw = os.environ.get("SLURM_CPUS_PER_TASK", "").strip()
+        if slurm_raw:
+            try:
+                slurm_cpus = int(slurm_raw)
+                if slurm_cpus > 0:
+                    return slurm_cpus
+            except ValueError:
+                pass
+
+        cpu_count = os.cpu_count() or 1
+        return max(1, int(cpu_count))
+
+    try:
+        workers = int(raw)
+    except ValueError as exc:
+        raise SystemExit("--index_workers must be a positive integer or 'auto'") from exc
+    if workers <= 0:
+        raise SystemExit("--index_workers must be > 0")
+    return workers
+
+
+def resolve_query_workers(query_workers_raw: str) -> int:
+    if query_workers_raw is None:
+        query_workers_raw = "auto"
+    raw = str(query_workers_raw).strip().lower()
+    if raw == "auto":
+        slurm_raw = os.environ.get("SLURM_CPUS_PER_TASK", "").strip()
+        if slurm_raw:
+            try:
+                slurm_cpus = int(slurm_raw)
+                if slurm_cpus > 0:
+                    return slurm_cpus
+            except ValueError:
+                pass
+        cpu_count = os.cpu_count() or 1
+        return max(1, int(cpu_count))
+
+    try:
+        workers = int(raw)
+    except ValueError as exc:
+        raise SystemExit("--query_workers must be a positive integer or 'auto'") from exc
+    if workers <= 0:
+        raise SystemExit("--query_workers must be > 0")
+    return workers
 
 
 def process_chunk(
@@ -349,6 +475,7 @@ def process_chunk(
     distance: float,
     use_hull_fill: bool,
     hull_eps: float,
+    query_workers: int,
 ) -> np.ndarray:
     n = chunk_xyz.shape[0]
     min_dists = np.full(n, np.inf, dtype=np.float32)
@@ -366,7 +493,7 @@ def process_chunk(
             continue
 
         candidates = chunk_xyz[in_box]
-        dists, _ = mask.tree.query(candidates, k=1, distance_upper_bound=distance, workers=1)
+        dists, _ = mask.tree.query(candidates, k=1, distance_upper_bound=distance, workers=query_workers)
         valid = dists != np.inf
         if not np.any(valid):
             continue
@@ -401,16 +528,18 @@ def process_chunk(
             continue
 
         test_pts = chunk_xyz[in_hull_box]
-        inside = np.zeros(test_pts.shape[0], dtype=bool) if hull.delaunay is None else (hull.delaunay.find_simplex(test_pts) >= 0)
-        boundary_dist, _ = hull.tree.query(test_pts, k=1, workers=1)
-        near = boundary_dist <= hull_eps
-        accepted = inside | near
+        # Half-space checks avoid per-point simplex tests and extra KD boundary queries.
+        plane_eval = test_pts @ hull.A.T + hull.b
+        dist_planes = np.max(plane_eval, axis=1)
+        inside = dist_planes <= 0.0
+        near = dist_planes <= float(hull_eps)
+        accepted = near
         if not np.any(accepted):
             continue
 
         local_idx = np.where(in_hull_box)[0]
         accepted_idx = local_idx[accepted]
-        accepted_score = np.where(inside[accepted], 0.0, boundary_dist[accepted]).astype(np.float32)
+        accepted_score = np.maximum(dist_planes[accepted], 0.0).astype(np.float32, copy=False)
         better = accepted_score < hull_best[accepted_idx]
         if np.any(better):
             widx = accepted_idx[better]
@@ -784,6 +913,23 @@ def main() -> None:
         default=0.10,
         help="Voxel size for target/mask sampling during QC plots",
     )
+    parser.add_argument(
+        "--index_workers",
+        type=str,
+        default="auto",
+        help="Workers for building mask KD-tree/hull indices (positive integer or 'auto'; default auto-detects CPU count or SLURM allocation)",
+    )
+    parser.add_argument(
+        "--query_workers",
+        type=str,
+        default="auto",
+        help="Workers for nearest-neighbor queries during assignment (positive integer or 'auto'; default auto-detects CPU count or SLURM allocation)",
+    )
+    parser.add_argument(
+        "--fast_index_build",
+        action="store_true",
+        help="Build less-balanced KD-trees to reduce startup time (query phase may be slower)",
+    )
     args = parser.parse_args()
 
     args.mask_folder = normalize_cli_path(args.mask_folder, must_exist=True)
@@ -805,6 +951,15 @@ def main() -> None:
         raise SystemExit("--plot_voxel_size must be > 0")
     if not args.hull_eps:
         args.hull_eps = args.distance
+
+    index_workers_auto = args.index_workers is None or str(args.index_workers).strip().lower() == "auto"
+    args.index_workers = resolve_index_workers(args.index_workers)
+    stage(
+        f"Index workers resolved to {args.index_workers} "
+        f"({'auto' if index_workers_auto else 'manual'})"
+    )
+    args.query_workers = resolve_query_workers(args.query_workers)
+    stage(f"Query workers resolved to {args.query_workers}")
 
     write_las = not args.ply_only
     write_ply = not args.ids_only
@@ -834,6 +989,9 @@ def main() -> None:
         out_dir=out_dir,
         las_suffix=las_suffix,
         load_chunk_size=args.chunk_size,
+        index_workers=args.index_workers,
+        index_workers_auto=index_workers_auto,
+        fast_index_build=args.fast_index_build,
     )
 
     if write_las:
@@ -866,6 +1024,8 @@ def main() -> None:
 
     total_points = 0
     assigned_points = 0
+    chunks_seen = 0
+    last_heartbeat_t = time.time()
     start_time = time.time()
 
     for target_file in target_files:
@@ -910,13 +1070,18 @@ def main() -> None:
                         args.distance,
                         use_hull_fill=args.hull_fill,
                         hull_eps=args.hull_eps,
+                        query_workers=args.query_workers,
                     )
+                    chunks_seen += 1
 
-                    for mask_idx, mask in enumerate(masks):
+                    matched_ids = np.unique(matched_mask_idx[matched_mask_idx >= 0])
+                    for mask_idx in matched_ids:
+                        mask = masks[int(mask_idx)]
                         sel = matched_mask_idx == mask_idx
                         if not np.any(sel):
                             continue
-                        assigned_points += int(np.sum(sel))
+                        sel_count = int(np.sum(sel))
+                        assigned_points += sel_count
 
                         if write_las:
                             subset = chunk[sel]
@@ -930,7 +1095,7 @@ def main() -> None:
                             las_writers[(mask.tree_id, mask.stem_id)].write_points(rec)
 
                         if write_ply:
-                            recs = np.zeros(int(np.sum(sel)), dtype=ply_dtype)
+                            recs = np.zeros(sel_count, dtype=ply_dtype)
                             pts = chunk_xyz[sel]
                             recs["x"] = pts[:, 0]
                             recs["y"] = pts[:, 1]
@@ -938,6 +1103,14 @@ def main() -> None:
                             recs["tree_id"] = mask.tree_id
                             recs["stem_id"] = mask.stem_id
                             ply_appenders[(mask.tree_id, mask.stem_id)].append(recs)
+
+                    now_t = time.time()
+                    if now_t - last_heartbeat_t >= 20.0:
+                        stage(
+                            f"Heartbeat: processed {chunks_seen} chunk(s), "
+                            f"scanned {total_points} point(s), assigned {assigned_points}"
+                        )
+                        last_heartbeat_t = now_t
 
         elif ext == ".ply":
             with open(target_file, "rb") as f:
@@ -969,15 +1142,20 @@ def main() -> None:
                     args.distance,
                     use_hull_fill=args.hull_fill,
                     hull_eps=args.hull_eps,
+                    query_workers=args.query_workers,
                 )
+                chunks_seen += 1
 
-                for mask_idx, mask in enumerate(masks):
+                matched_ids = np.unique(matched_mask_idx[matched_mask_idx >= 0])
+                for mask_idx in matched_ids:
+                    mask = masks[int(mask_idx)]
                     sel = matched_mask_idx == mask_idx
                     if not np.any(sel):
                         continue
-                    assigned_points += int(np.sum(sel))
+                    sel_count = int(np.sum(sel))
+                    assigned_points += sel_count
                     if write_ply:
-                        recs = np.zeros(int(np.sum(sel)), dtype=ply_dtype)
+                        recs = np.zeros(sel_count, dtype=ply_dtype)
                         sel_pts = chunk_xyz[sel]
                         recs["x"] = sel_pts[:, 0]
                         recs["y"] = sel_pts[:, 1]
@@ -985,6 +1163,14 @@ def main() -> None:
                         recs["tree_id"] = mask.tree_id
                         recs["stem_id"] = mask.stem_id
                         ply_appenders[(mask.tree_id, mask.stem_id)].append(recs)
+
+                now_t = time.time()
+                if now_t - last_heartbeat_t >= 20.0:
+                    stage(
+                        f"Heartbeat: processed {chunks_seen} chunk(s), "
+                        f"scanned {total_points} point(s), assigned {assigned_points}"
+                    )
+                    last_heartbeat_t = now_t
 
     if write_ply:
         for app in ply_appenders.values():
