@@ -28,7 +28,8 @@ PROGRESS_KW = {
     "leave": False,
     "mininterval": 0.5,
     "dynamic_ncols": True,
-    "disable": not sys.stderr.isatty(),
+    "disable": False,
+    "file": sys.stdout,
 }
 
 
@@ -72,7 +73,7 @@ def iter_points(path: Path, chunk_size: int) -> Iterable[np.ndarray]:
     raise ValueError(f"Unsupported file extension: {path.suffix}")
 
 
-def get_points(filepath: Path) -> np.ndarray:
+def get_points(filepath: Path, chunk_size: int = 500000, progress_desc: Optional[str] = None) -> np.ndarray:
     ext = filepath.suffix.lower()
     try:
         if ext == ".ply":
@@ -82,8 +83,29 @@ def get_points(filepath: Path) -> np.ndarray:
                 return np.vstack((v["x"], v["y"], v["z"])).T.astype(np.float32, copy=False)
         if ext in (".las", ".laz"):
             with laspy.open(filepath) as src:
-                las = src.read()
-                return np.vstack((las.x, las.y, las.z)).T.astype(np.float32, copy=False)
+                if src.header.point_count == 0:
+                    return np.empty((0, 3), dtype=np.float32)
+
+                chunks: List[np.ndarray] = []
+                total_chunks = max(1, (int(src.header.point_count) + int(chunk_size) - 1) // int(chunk_size))
+                chunk_iter = src.chunk_iterator(chunk_size)
+                if progress_desc is not None:
+                    chunk_iter = tqdm(
+                        chunk_iter,
+                        total=total_chunks,
+                        desc=progress_desc,
+                        unit="chunk",
+                        **PROGRESS_KW,
+                    )
+
+                for chunk in chunk_iter:
+                    xyz = np.vstack((chunk.x, chunk.y, chunk.z)).T.astype(np.float32, copy=False)
+                    if xyz.shape[0] > 0:
+                        chunks.append(xyz)
+
+                if not chunks:
+                    return np.empty((0, 3), dtype=np.float32)
+                return np.vstack(chunks)
     except Exception as exc:
         stage(f"Warning: failed to read {filepath}: {exc}")
     return np.empty((0, 3), dtype=np.float32)
@@ -198,11 +220,11 @@ class PlyStructAppender:
                 pass
 
 
-def build_hull_info(points: np.ndarray, decimation_size: float, vox_mul: float) -> Optional[HullInfo]:
+def build_hull_info(points: np.ndarray, distance: float, vox_mul: float) -> Optional[HullInfo]:
     if points.shape[0] < 8:
         return None
 
-    grid = float(decimation_size) * float(vox_mul)
+    grid = float(distance) * float(vox_mul)
     if grid <= 0:
         return None
 
@@ -265,10 +287,10 @@ def load_masks(
     mask_folder: Path,
     distance: float,
     use_hull_fill: bool,
-    decimation_size: Optional[float],
     vox_mul: float,
     out_dir: Path,
     las_suffix: str,
+    load_chunk_size: int,
 ) -> List[MaskRecord]:
     grouped: Dict[Tuple[int, int], List[np.ndarray]] = {}
     mask_files = list_point_files(mask_folder)
@@ -282,7 +304,8 @@ def load_masks(
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
 
-        pts = get_points(path)
+        read_desc = f"Read {path.name}" if path.suffix.lower() in (".las", ".laz") else None
+        pts = get_points(path, chunk_size=load_chunk_size, progress_desc=read_desc)
         if pts.shape[0] == 0:
             continue
         grouped.setdefault((tree_id, stem_id), []).append(pts)
@@ -300,7 +323,7 @@ def load_masks(
 
         hull = None
         if use_hull_fill:
-            hull = build_hull_info(pts, float(decimation_size), vox_mul)
+            hull = build_hull_info(pts, float(distance), vox_mul)
 
         masks.append(
             MaskRecord(
@@ -709,37 +732,30 @@ def main() -> None:
     parser.add_argument("-d", "--distance", type=float, required=True, help="Distance threshold for primary match")
     parser.add_argument("--chunk-size", type=int, default=500000, help="Points per chunk (default: 500,000)")
     parser.add_argument(
-        "--ids-only",
+        "--ids_only",
         action="store_true",
         help="Only write LAS/LAZ outputs with tree_id and stem_id (skip PLY outputs)",
     )
     parser.add_argument(
-        "--ply-only",
+        "--ply_only",
         action="store_true",
         help="Only write PLY outputs (skip LAS/LAZ outputs)",
     )
     parser.add_argument(
-        "--hull-fill",
+        "--hull_fill",
         action="store_true",
         help="Enable secondary hull-based inclusion for unmatched points",
     )
     parser.add_argument(
-        "--decimation-size",
-        type=float,
-        default=None,
-        help="Base decimation size used with hull fill (required for --hull-fill)",
-    )
-    parser.add_argument(
-        "--vox-mul",
+        "--vox_mul",
         type=float,
         default=3.0,
-        help="Voxel multiplier for hull support grid size: decimation_size * vox_mul (default 3)",
+        help="Voxel multiplier for hull support grid size: distance * vox_mul (default 3)",
     )
     parser.add_argument(
-        "--hull-eps",
+        "--hull_eps",
         type=float,
-        default=0.05,
-        help="Small epsilon distance used for near-hull inclusion (default 0.05)",
+        help="Small epsilon distance used for near-hull inclusion (default --distance if not set)",
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug QC plots after mask assignment")
     parser.add_argument("--plot_count", type=int, default=4, help="Number of random masks to plot for QC")
@@ -781,15 +797,14 @@ def main() -> None:
         raise SystemExit("--distance must be > 0")
     if args.chunk_size <= 0:
         raise SystemExit("--chunk-size must be > 0")
-    if args.hull_fill and (args.decimation_size is None or args.decimation_size <= 0):
-        raise SystemExit("--hull-fill requires --decimation-size > 0")
-
     if args.plot_count < 0:
         raise SystemExit("--plot_count must be >= 0")
     if args.plot_target_max_points < 1000 or args.plot_mask_max_points < 1000:
         raise SystemExit("--plot_target_max_points and --plot_mask_max_points must be >= 1000")
     if args.plot_voxel_size <= 0:
         raise SystemExit("--plot_voxel_size must be > 0")
+    if not args.hull_eps:
+        args.hull_eps = args.distance
 
     write_las = not args.ply_only
     write_ply = not args.ids_only
@@ -815,10 +830,10 @@ def main() -> None:
         mask_folder=args.mask_folder,
         distance=args.distance,
         use_hull_fill=args.hull_fill,
-        decimation_size=args.decimation_size,
         vox_mul=args.vox_mul,
         out_dir=out_dir,
         las_suffix=las_suffix,
+        load_chunk_size=args.chunk_size,
     )
 
     if write_las:
@@ -845,7 +860,7 @@ def main() -> None:
     stage(f"Primary assignment distance: {args.distance}")
     if args.hull_fill:
         stage(
-            f"Hull fill enabled: decimation_size={args.decimation_size}, "
+            f"Hull fill enabled: support_spacing=distance({args.distance}), "
             f"vox_mul={args.vox_mul}, hull_eps={args.hull_eps}"
         )
 
