@@ -1060,69 +1060,73 @@ def main() -> None:
                     las_output_paths.append(masked_out)
                     las_writer = stack.enter_context(laspy.open(masked_out, mode="w", header=out_header))
 
-                for chunk in tqdm(
-                    src.chunk_iterator(args.chunk_size),
+                with tqdm(
+                    total=int(src.header.point_count),
                     unit="pts",
                     desc=f"Assign {target_file.name}",
                     **PROGRESS_KW,
-                ):
-                    chunk_xyz = np.vstack((chunk.x, chunk.y, chunk.z)).T.astype(np.float32, copy=False)
-                    if chunk_xyz.shape[0] == 0:
-                        continue
-                    total_points += chunk_xyz.shape[0]
-
-                    matched_mask_idx = process_chunk(
-                        chunk_xyz,
-                        masks,
-                        args.distance,
-                        use_hull_fill=args.hull_fill,
-                        hull_eps=args.hull_eps,
-                        query_workers=args.query_workers,
-                    )
-                    chunks_seen += 1
-
-                    matched_sel = matched_mask_idx >= 0
-                    if write_las and las_writer is not None:
-                        tree_ids = np.zeros(chunk_xyz.shape[0], dtype=np.int32)
-                        stem_ids = np.zeros(chunk_xyz.shape[0], dtype=np.int32)
-                        if np.any(matched_sel):
-                            tree_ids[matched_sel] = mask_tree_ids[matched_mask_idx[matched_sel]]
-                            stem_ids[matched_sel] = mask_stem_ids[matched_mask_idx[matched_sel]]
-                        rec = make_point_record_with_ids(
-                            chunk_subset=chunk,
-                            out_header=out_header,
-                            src_dim_names=src_dim_names,
-                            tree_id=tree_ids,
-                            stem_id=stem_ids,
-                        )
-                        las_writer.write_points(rec)
-
-                    matched_ids = np.unique(matched_mask_idx[matched_mask_idx >= 0])
-                    for mask_idx in matched_ids:
-                        mask = masks[int(mask_idx)]
-                        sel = matched_mask_idx == mask_idx
-                        if not np.any(sel):
+                ) as pbar_assign:
+                    for chunk in src.chunk_iterator(args.chunk_size):
+                        chunk_xyz = np.vstack((chunk.x, chunk.y, chunk.z)).T.astype(np.float32, copy=False)
+                        if chunk_xyz.shape[0] == 0:
                             continue
-                        sel_count = int(np.sum(sel))
-                        assigned_points += sel_count
+                        n_chunk_pts = int(chunk_xyz.shape[0])
+                        total_points += n_chunk_pts
 
-                        if write_ply:
-                            recs = np.zeros(sel_count, dtype=ply_dtype)
-                            pts = chunk_xyz[sel]
-                            recs["x"] = pts[:, 0]
-                            recs["y"] = pts[:, 1]
-                            recs["z"] = pts[:, 2]
-                            recs["tree_id"] = mask.tree_id
-                            recs["stem_id"] = mask.stem_id
-                            ply_appenders[(mask.tree_id, mask.stem_id)].append(recs)
-
-                    now_t = time.time()
-                    if now_t - last_heartbeat_t >= 20.0:
-                        stage(
-                            f"Heartbeat: processed {chunks_seen} chunk(s), "
-                            f"scanned {total_points} point(s), assigned {assigned_points}"
+                        matched_mask_idx = process_chunk(
+                            chunk_xyz,
+                            masks,
+                            args.distance,
+                            use_hull_fill=args.hull_fill,
+                            hull_eps=args.hull_eps,
+                            query_workers=args.query_workers,
                         )
-                        last_heartbeat_t = now_t
+                        chunks_seen += 1
+
+                        matched_sel = matched_mask_idx >= 0
+                        if write_las and las_writer is not None:
+                            tree_ids = np.zeros(chunk_xyz.shape[0], dtype=np.int32)
+                            stem_ids = np.zeros(chunk_xyz.shape[0], dtype=np.int32)
+                            if np.any(matched_sel):
+                                tree_ids[matched_sel] = mask_tree_ids[matched_mask_idx[matched_sel]]
+                                stem_ids[matched_sel] = mask_stem_ids[matched_mask_idx[matched_sel]]
+                            rec = make_point_record_with_ids(
+                                chunk_subset=chunk,
+                                out_header=out_header,
+                                src_dim_names=src_dim_names,
+                                tree_id=tree_ids,
+                                stem_id=stem_ids,
+                            )
+                            las_writer.write_points(rec)
+
+                        matched_ids = np.unique(matched_mask_idx[matched_mask_idx >= 0])
+                        for mask_idx in matched_ids:
+                            mask = masks[int(mask_idx)]
+                            sel = matched_mask_idx == mask_idx
+                            if not np.any(sel):
+                                continue
+                            sel_count = int(np.sum(sel))
+                            assigned_points += sel_count
+
+                            if write_ply:
+                                recs = np.zeros(sel_count, dtype=ply_dtype)
+                                pts = chunk_xyz[sel]
+                                recs["x"] = pts[:, 0]
+                                recs["y"] = pts[:, 1]
+                                recs["z"] = pts[:, 2]
+                                recs["tree_id"] = mask.tree_id
+                                recs["stem_id"] = mask.stem_id
+                                ply_appenders[(mask.tree_id, mask.stem_id)].append(recs)
+
+                        pbar_assign.update(n_chunk_pts)
+
+                        now_t = time.time()
+                        if now_t - last_heartbeat_t >= 20.0:
+                            stage(
+                                f"Heartbeat: processed {chunks_seen} chunk(s), "
+                                f"scanned {total_points} point(s), assigned {assigned_points}"
+                            )
+                            last_heartbeat_t = now_t
 
         elif ext == ".ply":
             with open(target_file, "rb") as f:
@@ -1136,53 +1140,57 @@ def main() -> None:
                     "LAS/LAZ output is enabled but target contains PLY input. Use --ply-only for PLY targets"
                 )
 
-            for start_idx in tqdm(
-                range(0, pts.shape[0], args.chunk_size),
+            with tqdm(
+                total=int(pts.shape[0]),
                 unit="pts",
                 desc=f"Assign {target_file.name}",
                 **PROGRESS_KW,
-            ):
-                end_idx = min(start_idx + args.chunk_size, pts.shape[0])
-                chunk_xyz = pts[start_idx:end_idx]
-                if chunk_xyz.shape[0] == 0:
-                    continue
-                total_points += chunk_xyz.shape[0]
-
-                matched_mask_idx = process_chunk(
-                    chunk_xyz,
-                    masks,
-                    args.distance,
-                    use_hull_fill=args.hull_fill,
-                    hull_eps=args.hull_eps,
-                    query_workers=args.query_workers,
-                )
-                chunks_seen += 1
-
-                matched_ids = np.unique(matched_mask_idx[matched_mask_idx >= 0])
-                for mask_idx in matched_ids:
-                    mask = masks[int(mask_idx)]
-                    sel = matched_mask_idx == mask_idx
-                    if not np.any(sel):
+            ) as pbar_assign:
+                for start_idx in range(0, pts.shape[0], args.chunk_size):
+                    end_idx = min(start_idx + args.chunk_size, pts.shape[0])
+                    chunk_xyz = pts[start_idx:end_idx]
+                    if chunk_xyz.shape[0] == 0:
                         continue
-                    sel_count = int(np.sum(sel))
-                    assigned_points += sel_count
-                    if write_ply:
-                        recs = np.zeros(sel_count, dtype=ply_dtype)
-                        sel_pts = chunk_xyz[sel]
-                        recs["x"] = sel_pts[:, 0]
-                        recs["y"] = sel_pts[:, 1]
-                        recs["z"] = sel_pts[:, 2]
-                        recs["tree_id"] = mask.tree_id
-                        recs["stem_id"] = mask.stem_id
-                        ply_appenders[(mask.tree_id, mask.stem_id)].append(recs)
+                    n_chunk_pts = int(chunk_xyz.shape[0])
+                    total_points += n_chunk_pts
 
-                now_t = time.time()
-                if now_t - last_heartbeat_t >= 20.0:
-                    stage(
-                        f"Heartbeat: processed {chunks_seen} chunk(s), "
-                        f"scanned {total_points} point(s), assigned {assigned_points}"
+                    matched_mask_idx = process_chunk(
+                        chunk_xyz,
+                        masks,
+                        args.distance,
+                        use_hull_fill=args.hull_fill,
+                        hull_eps=args.hull_eps,
+                        query_workers=args.query_workers,
                     )
-                    last_heartbeat_t = now_t
+                    chunks_seen += 1
+
+                    matched_ids = np.unique(matched_mask_idx[matched_mask_idx >= 0])
+                    for mask_idx in matched_ids:
+                        mask = masks[int(mask_idx)]
+                        sel = matched_mask_idx == mask_idx
+                        if not np.any(sel):
+                            continue
+                        sel_count = int(np.sum(sel))
+                        assigned_points += sel_count
+                        if write_ply:
+                            recs = np.zeros(sel_count, dtype=ply_dtype)
+                            sel_pts = chunk_xyz[sel]
+                            recs["x"] = sel_pts[:, 0]
+                            recs["y"] = sel_pts[:, 1]
+                            recs["z"] = sel_pts[:, 2]
+                            recs["tree_id"] = mask.tree_id
+                            recs["stem_id"] = mask.stem_id
+                            ply_appenders[(mask.tree_id, mask.stem_id)].append(recs)
+
+                    pbar_assign.update(n_chunk_pts)
+
+                    now_t = time.time()
+                    if now_t - last_heartbeat_t >= 20.0:
+                        stage(
+                            f"Heartbeat: processed {chunks_seen} chunk(s), "
+                            f"scanned {total_points} point(s), assigned {assigned_points}"
+                        )
+                        last_heartbeat_t = now_t
 
     if write_ply:
         for app in ply_appenders.values():
