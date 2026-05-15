@@ -783,7 +783,9 @@ def main() -> None:
         write_dat_matrix(matrix_path, final_transform)
     plot_match_distance = float(args.plot_match_distance) if args.plot_match_distance is not None else float(args.icp_threshold)
 
-    transformed_paths = [out_dir / row["file"] for row in file_report]
+    transformed_paths = [out_dir / p.name for p in mask_files if (out_dir / p.name).exists()]
+    if not transformed_paths:
+        transformed_paths = [out_dir / row["file"] for row in file_report]
     qc_stats: List[Dict[str, object]] = []
     if args.debug and args.plot_count > 0:
         print("Generating QC plots...")
