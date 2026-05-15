@@ -33,6 +33,10 @@ Use `mask.py` when you have:
 - By default writes both:
   - LAS/LAZ outputs per unique mask with extra dimensions `tree_id` and `stem_id`
   - PLY outputs per unique mask with fields `(x, y, z, tree_id, stem_id)`
+- Optional QC/debug plotting (`--debug`) after assignment:
+  - per-mask 3-view figures (`*_views.png`): top, front, aerial
+  - `qc_overview_2x2.png` from sampled masks
+  - persistent selection state in `qc_plots/debug_selection.json` for reproducible debug comparisons
 
 ### Optional one-action modes
 
@@ -45,7 +49,7 @@ Use `mask.py` when you have:
 - Nearest-distance assignment remains primary; hull fill only adds missed points.
 - Hull support points are built from voxelized z-slices using the extreme XY point rule.
 - Related flags:
-  - `--decimation-size` (required with `--hull-fill`)
+  - `--distance` (also used as hull support spacing base)
   - `--vox-mul` (default `3`, voxel size multiplier)
   - `--hull-eps` (default `0.05`, near-hull tolerance)
 
@@ -69,7 +73,6 @@ python mask.py \
   --distance 0.5 \
   --ply-only \
   --hull-fill \
-  --decimation-size 0.03 \
   --vox-mul 3 \
   --hull-eps 0.05
 ```
@@ -137,14 +140,8 @@ Use `mask_align.py` when you need to align mask coordinates to a target cloud us
 - final transform matrix in DAT format: `mask_to_target_transform.DAT`
 - ICP report JSON: `icp_report.json` (fitness, RMSE, residual summary, matrices, file list)
 - one-row CSV summary: `icp_summary.csv`
-- QC plots under `qc_plots/` (only when `--debug` is enabled):
-  - random per-mask 3-view figures (`*_views.png`): top, front, aerial
-  - `qc_overview_2x2.png` from 4 randomly selected masks
 
-QC colors:
-- green: target points matched to mask
-- black: target points in mask bbox but unmatched
-- red: mask points with no match in target
+Note: QC/debug plotting is handled by `mask.py`, not `mask_align.py`.
 
 ### Example
 
@@ -160,21 +157,6 @@ python mask_align.py \
   --icp_threshold 1.0 \
   --icp_max_iter 60
 ```
-
-### QC plot controls
-
-- `--plot_count` (default `4`): number of random masks to visualize
-- `--plot_seed` (default `42`): random seed for reproducible mask selection
-- `--plot_match_distance` (default `--icp_threshold`): match threshold used for QC colors
-- `--plot_target_max_points` (default `300000`): target sample cap for plots
-- `--plot_mask_max_points` (default `120000`): per-mask sample cap for plots
-- `--plot_voxel_size` (default `0.10`): voxel thinning size for target plot sampling
-- `--debug`: required to generate QC plots
-
-### Reuse mode
-
-- `--reuse-existing-masks`: if transformed masks and `mask_to_target_transform.DAT` already exist in `output_dir`, the script reuses them instead of recomputing alignment and rewriting masks.
-- This is useful when rerunning the same site and you want to keep the same transformed masks.
 
 ### Notes
 

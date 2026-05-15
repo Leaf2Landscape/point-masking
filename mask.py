@@ -143,6 +143,7 @@ class HullInfo:
     maxs: np.ndarray
     A: np.ndarray
     b: np.ndarray
+    hull_points: np.ndarray
 
 
 @dataclass
@@ -192,7 +193,6 @@ def build_mask_record(
         mins=mins,
         maxs=maxs,
         hull=hull,
-        las_out=out_dir / f"{key_name}{las_suffix}",
         ply_out=out_dir / f"{key_name}.ply",
     )
 
@@ -297,6 +297,7 @@ def build_hull_info(points: np.ndarray, distance: float, vox_mul: float) -> Opti
         maxs=np.max(hull_pts, axis=0).astype(np.float32),
         A=A,
         b=b,
+        hull_points=hull_pts.astype(np.float32, copy=False),
     )
 
 
@@ -563,8 +564,8 @@ def make_point_record_with_ids(
     chunk_subset,
     out_header: laspy.LasHeader,
     src_dim_names: List[str],
-    tree_id: int,
-    stem_id: int,
+    tree_id,
+    stem_id,
 ):
     rec = ScaleAwarePointRecord.zeros(len(chunk_subset), header=out_header)
     for dim in src_dim_names:
@@ -572,8 +573,14 @@ def make_point_record_with_ids(
             continue
         if hasattr(chunk_subset, dim):
             setattr(rec, dim, np.asarray(getattr(chunk_subset, dim)))
-    rec.tree_id = np.full(len(chunk_subset), tree_id, dtype=np.int32)
-    rec.stem_id = np.full(len(chunk_subset), stem_id, dtype=np.int32)
+    if np.isscalar(tree_id):
+        rec.tree_id = np.full(len(chunk_subset), tree_id, dtype=np.int32)
+    else:
+        rec.tree_id = np.asarray(tree_id, dtype=np.int32)
+    if np.isscalar(stem_id):
+        rec.stem_id = np.full(len(chunk_subset), stem_id, dtype=np.int32)
+    else:
+        rec.stem_id = np.asarray(stem_id, dtype=np.int32)
     return rec
 
 
@@ -644,25 +651,52 @@ def capped_voxel_sample(
     return np.vstack(kept)
 
 
-def _scatter_view(
+def sample_points_array(points: np.ndarray, voxel_size: float, max_points: int) -> np.ndarray:
+    pts = points.astype(np.float32, copy=False)
+    if pts.shape[0] == 0:
+        return pts
+
+    if voxel_size > 0:
+        vox = np.floor(pts / voxel_size).astype(np.int64)
+        _, idx = np.unique(vox, axis=0, return_index=True)
+        pts = pts[np.sort(idx)]
+
+    if pts.shape[0] > max_points:
+        pick = np.linspace(0, pts.shape[0] - 1, num=max_points, dtype=np.int64)
+        pts = pts[pick]
+
+    return pts.astype(np.float32, copy=False)
+
+
+def _scatter_compare_view(
     ax,
     title: str,
-    tgt_matched: np.ndarray,
-    tgt_unmatched: np.ndarray,
-    mask_unmatched: np.ndarray,
+    input_pts: np.ndarray,
+    output_pts: np.ndarray,
     proj_fn,
+    hull_points: Optional[np.ndarray] = None,
     xlim=None,
     ylim=None,
 ) -> None:
-    if tgt_unmatched.shape[0] > 0:
-        p = proj_fn(tgt_unmatched)
-        ax.scatter(p[:, 0], p[:, 1], s=1.0, c="black", alpha=0.55, linewidths=0)
-    if tgt_matched.shape[0] > 0:
-        p = proj_fn(tgt_matched)
-        ax.scatter(p[:, 0], p[:, 1], s=1.2, c="#22c55e", alpha=0.75, linewidths=0)
-    if mask_unmatched.shape[0] > 0:
-        p = proj_fn(mask_unmatched)
-        ax.scatter(p[:, 0], p[:, 1], s=1.8, c="#ef4444", alpha=0.85, linewidths=0)
+    if input_pts.shape[0] > 0:
+        p = proj_fn(input_pts)
+        ax.scatter(p[:, 0], p[:, 1], s=1.3, c="#2563eb", alpha=0.18, linewidths=0)
+    if output_pts.shape[0] > 0:
+        p = proj_fn(output_pts)
+        ax.scatter(p[:, 0], p[:, 1], s=1.3, c="#f97316", alpha=0.18, linewidths=0)
+
+    if hull_points is not None and hull_points.shape[0] >= 3:
+        hp = proj_fn(hull_points)
+        if hp.shape[0] >= 3:
+            try:
+                hp_hull = ConvexHull(hp)
+                poly = hp[hp_hull.vertices]
+                if poly.shape[0] >= 3:
+                    poly = np.vstack((poly, poly[0]))
+                    ax.plot(poly[:, 0], poly[:, 1], color="#e11d48", linewidth=1.2, alpha=0.95)
+            except QhullError:
+                pass
+
     ax.set_title(title, fontsize=10)
     ax.set_aspect("equal", adjustable="box")
     ax.grid(False)
@@ -672,61 +706,48 @@ def _scatter_view(
         ax.set_ylim(ylim)
 
 
-def _extract_plot_sets(
-    mask_pts: np.ndarray,
-    target_points: np.ndarray,
-    match_dist: float,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    mins = np.min(mask_pts, axis=0)
-    maxs = np.max(mask_pts, axis=0)
-    pad = float(match_dist)
-    in_bbox = np.all((target_points >= (mins - pad)) & (target_points <= (maxs + pad)), axis=1)
-    target_local = target_points[in_bbox]
-    if target_local.shape[0] == 0:
-        return target_local, target_local, mask_pts, mins, maxs
+def _overlay_bounds(input_pts: np.ndarray, output_pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    if input_pts.shape[0] > 0 and output_pts.shape[0] > 0:
+        combined = np.vstack((input_pts, output_pts))
+    elif input_pts.shape[0] > 0:
+        combined = input_pts
+    else:
+        combined = output_pts
 
-    mask_tree = cKDTree(mask_pts)
-    d_tgt, _ = mask_tree.query(target_local, k=1, workers=1)
-    tgt_matched = target_local[d_tgt <= match_dist]
-    tgt_unmatched = target_local[d_tgt > match_dist]
-
-    tgt_tree = cKDTree(target_local)
-    d_mask, _ = tgt_tree.query(mask_pts, k=1, workers=1)
-    mask_unmatched = mask_pts[d_mask > match_dist]
-    return tgt_matched, tgt_unmatched, mask_unmatched, mins, maxs
+    if combined.shape[0] == 0:
+        zeros = np.zeros(3, dtype=np.float32)
+        return zeros, zeros
+    return np.min(combined, axis=0), np.max(combined, axis=0)
 
 
 def generate_qc_plots(
-    mask_paths: List[Path],
-    target_files: List[Path],
+    masks: List[MaskRecord],
     out_dir: Path,
     rng_seed: int,
     count: int,
-    match_dist: float,
-    target_plot_max_points: int,
     mask_plot_max_points: int,
-    sample_chunk_size: int,
     plot_voxel_size: float,
+    show_hull_outline: bool,
     selection_state_path: Optional[Path],
     debug_settings: Optional[Dict[str, object]],
 ) -> Tuple[List[Dict[str, object]], List[str], bool]:
     if plt is None:
         raise RuntimeError("matplotlib is required for QC plots. Install matplotlib and rerun.")
-    if not mask_paths:
+    if not masks:
         return [], [], False
 
-    chosen: List[Path] = []
+    chosen: List[MaskRecord] = []
     reused_selection = False
-    candidate_map = {p.name: p for p in mask_paths}
+    candidate_map = {f"{m.tree_id}_{m.stem_id}": m for m in masks}
 
     if selection_state_path is not None and debug_settings is not None and selection_state_path.exists():
         try:
             state = json.loads(selection_state_path.read_text(encoding="utf-8"))
             if state.get("debug_settings") == debug_settings:
-                selected_names = state.get("selected_masks", [])
-                if isinstance(selected_names, list) and selected_names:
-                    restored = [candidate_map[name] for name in selected_names if name in candidate_map]
-                    if len(restored) == len(selected_names):
+                selected_keys = state.get("selected_masks", [])
+                if isinstance(selected_keys, list) and selected_keys:
+                    restored = [candidate_map[key] for key in selected_keys if key in candidate_map]
+                    if len(restored) == len(selected_keys):
                         chosen = restored
                         reused_selection = True
         except Exception:
@@ -734,99 +755,86 @@ def generate_qc_plots(
 
     if not chosen:
         rng = random.Random(rng_seed)
-        n_pick = min(int(count), len(mask_paths))
-        chosen = rng.sample(mask_paths, n_pick)
+        n_pick = min(int(count), len(masks))
+        chosen = rng.sample(masks, n_pick)
         if selection_state_path is not None and debug_settings is not None:
             selection_state_path.parent.mkdir(parents=True, exist_ok=True)
             state = {
                 "debug_settings": debug_settings,
-                "selected_masks": [p.name for p in chosen],
+                "selected_masks": [f"{m.tree_id}_{m.stem_id}" for m in chosen],
             }
             selection_state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
-
-    stage("Sampling target for QC plots")
-    target_plot_points = capped_voxel_sample(
-        files=target_files,
-        chunk_size=sample_chunk_size,
-        voxel_size=plot_voxel_size,
-        max_points=target_plot_max_points,
-    )
-    if target_plot_points.shape[0] == 0:
-        raise RuntimeError("Could not sample target points for QC plots")
 
     plot_dir = out_dir / "qc_plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
 
     per_mask_stats: List[Dict[str, object]] = []
-    overview_data: List[Tuple[str, np.ndarray, np.ndarray, np.ndarray]] = []
+    overview_data: List[Tuple[str, np.ndarray, np.ndarray, Optional[np.ndarray]]] = []
 
-    for mask_path in chosen:
-        mask_pts = capped_voxel_sample(
-            files=[mask_path],
-            chunk_size=sample_chunk_size,
-            voxel_size=plot_voxel_size,
-            max_points=mask_plot_max_points,
-        )
-        if mask_pts.shape[0] == 0:
-            continue
+    for mask in chosen:
+        input_pts = sample_points_array(mask.points, plot_voxel_size, mask_plot_max_points)
+        output_pts = np.empty((0, 3), dtype=np.float32)
+        if mask.ply_out is not None and mask.ply_out.exists():
+            output_pts = capped_voxel_sample(
+                files=[mask.ply_out],
+                chunk_size=max(1, mask_plot_max_points),
+                voxel_size=plot_voxel_size,
+                max_points=mask_plot_max_points,
+            )
 
-        tgt_match, tgt_unmatch, mask_unmatch, mins, maxs = _extract_plot_sets(
-            mask_pts=mask_pts,
-            target_points=target_plot_points,
-            match_dist=match_dist,
-        )
+        hull_pts = mask.hull.hull_points if show_hull_outline and mask.hull is not None else None
+
+        mins, maxs = _overlay_bounds(input_pts, output_pts)
 
         fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), dpi=180)
-        _scatter_view(
+        _scatter_compare_view(
             axes[0],
             "Top (XY)",
-            tgt_match,
-            tgt_unmatch,
-            mask_unmatch,
+            input_pts,
+            output_pts,
             project_top,
+            hull_points=hull_pts,
             xlim=(float(mins[0]), float(maxs[0])),
             ylim=(float(mins[1]), float(maxs[1])),
         )
-        _scatter_view(
+        _scatter_compare_view(
             axes[1],
             "Front (XZ)",
-            tgt_match,
-            tgt_unmatch,
-            mask_unmatch,
+            input_pts,
+            output_pts,
             project_front,
+            hull_points=hull_pts,
             xlim=(float(mins[0]), float(maxs[0])),
             ylim=(float(mins[2]), float(maxs[2])),
         )
         corners = bbox_corners(mins, maxs)
         ac = project_aerial(corners)
-        _scatter_view(
+        _scatter_compare_view(
             axes[2],
             "Aerial (Oblique)",
-            tgt_match,
-            tgt_unmatch,
-            mask_unmatch,
+            input_pts,
+            output_pts,
             project_aerial,
+            hull_points=hull_pts,
             xlim=(float(np.min(ac[:, 0])), float(np.max(ac[:, 0]))),
             ylim=(float(np.min(ac[:, 1])), float(np.max(ac[:, 1]))),
         )
         fig.suptitle(
-            f"Mask {mask_path.name} | green=target matched | black=target unmatched | red=mask unmatched",
+            f"Mask {mask.tree_id}_{mask.stem_id} | blue=input mask | orange=output mask",
             fontsize=11,
         )
         fig.tight_layout()
-        fig_path = plot_dir / f"{mask_path.stem}_views.png"
+        fig_path = plot_dir / f"{mask.tree_id}_{mask.stem_id}_views.png"
         fig.savefig(fig_path, bbox_inches="tight")
         plt.close(fig)
 
-        overview_data.append((mask_path.name, tgt_match, tgt_unmatch, mask_unmatch))
+        overview_data.append((f"{mask.tree_id}_{mask.stem_id}", input_pts, output_pts, hull_pts))
         per_mask_stats.append(
             {
-                "mask_file": mask_path.name,
+                "mask_file": f"{mask.tree_id}_{mask.stem_id}",
                 "plot_path": str(fig_path),
-                "target_points_in_bbox": int(tgt_match.shape[0] + tgt_unmatch.shape[0]),
-                "target_matched": int(tgt_match.shape[0]),
-                "target_unmatched": int(tgt_unmatch.shape[0]),
-                "mask_unmatched": int(mask_unmatch.shape[0]),
+                "input_points_sampled": int(input_pts.shape[0]),
+                "output_points_sampled": int(output_pts.shape[0]),
             }
         )
 
@@ -837,10 +845,17 @@ def generate_qc_plots(
             if i >= len(overview_data):
                 ax.axis("off")
                 continue
-            name, tgt_match, tgt_unmatch, mask_unmatch = overview_data[i]
-            _scatter_view(ax, f"{name} (Aerial)", tgt_match, tgt_unmatch, mask_unmatch, project_aerial)
+            name, input_pts, output_pts, hull_pts = overview_data[i]
+            _scatter_compare_view(
+                ax,
+                f"{name} (Aerial)",
+                input_pts,
+                output_pts,
+                project_aerial,
+                hull_points=hull_pts,
+            )
         fig.suptitle(
-            "QC sample (2x2): green=target matched | black=target unmatched | red=mask unmatched",
+            "QC sample (2x2): blue=input mask | orange=output mask",
             fontsize=12,
         )
         fig.tight_layout()
@@ -848,7 +863,7 @@ def generate_qc_plots(
         fig.savefig(grid_path, bbox_inches="tight")
         plt.close(fig)
 
-    return per_mask_stats, [p.name for p in chosen], reused_selection
+    return per_mask_stats, [f"{m.tree_id}_{m.stem_id}" for m in chosen], reused_selection
 
 
 def main() -> None:
@@ -994,10 +1009,8 @@ def main() -> None:
         fast_index_build=args.fast_index_build,
     )
 
-    if write_las:
-        for m in masks:
-            if m.las_out is not None and m.las_out.exists():
-                m.las_out.unlink()
+    mask_tree_ids = np.asarray([m.tree_id for m in masks], dtype=np.int32)
+    mask_stem_ids = np.asarray([m.stem_id for m in masks], dtype=np.int32)
 
     ply_dtype = np.dtype(
         [
@@ -1027,6 +1040,7 @@ def main() -> None:
     chunks_seen = 0
     last_heartbeat_t = time.time()
     start_time = time.time()
+    las_output_paths: List[Path] = []
 
     for target_file in target_files:
         ext = target_file.suffix.lower()
@@ -1038,20 +1052,13 @@ def main() -> None:
                 src_dim_names = list(src.header.point_format.dimension_names)
                 out_header = build_las_header_with_ids(src.header) if write_las else None
 
-                las_writers: Dict[Tuple[int, int], object] = {}
+                las_writer = None
                 if write_las:
-                    for m in masks:
-                        out_path = m.las_out
-                        if out_path is None:
-                            continue
-                        if out_path.exists():
-                            las_writers[(m.tree_id, m.stem_id)] = stack.enter_context(
-                                laspy.open(out_path, mode="a")
-                            )
-                        else:
-                            las_writers[(m.tree_id, m.stem_id)] = stack.enter_context(
-                                laspy.open(out_path, mode="w", header=out_header)
-                            )
+                    masked_out = out_dir / f"{target_file.stem}_masked{las_suffix}"
+                    if masked_out.exists():
+                        masked_out.unlink()
+                    las_output_paths.append(masked_out)
+                    las_writer = stack.enter_context(laspy.open(masked_out, mode="w", header=out_header))
 
                 for chunk in tqdm(
                     src.chunk_iterator(args.chunk_size),
@@ -1074,6 +1081,22 @@ def main() -> None:
                     )
                     chunks_seen += 1
 
+                    matched_sel = matched_mask_idx >= 0
+                    if write_las and las_writer is not None:
+                        tree_ids = np.zeros(chunk_xyz.shape[0], dtype=np.int32)
+                        stem_ids = np.zeros(chunk_xyz.shape[0], dtype=np.int32)
+                        if np.any(matched_sel):
+                            tree_ids[matched_sel] = mask_tree_ids[matched_mask_idx[matched_sel]]
+                            stem_ids[matched_sel] = mask_stem_ids[matched_mask_idx[matched_sel]]
+                        rec = make_point_record_with_ids(
+                            chunk_subset=chunk,
+                            out_header=out_header,
+                            src_dim_names=src_dim_names,
+                            tree_id=tree_ids,
+                            stem_id=stem_ids,
+                        )
+                        las_writer.write_points(rec)
+
                     matched_ids = np.unique(matched_mask_idx[matched_mask_idx >= 0])
                     for mask_idx in matched_ids:
                         mask = masks[int(mask_idx)]
@@ -1082,17 +1105,6 @@ def main() -> None:
                             continue
                         sel_count = int(np.sum(sel))
                         assigned_points += sel_count
-
-                        if write_las:
-                            subset = chunk[sel]
-                            rec = make_point_record_with_ids(
-                                chunk_subset=subset,
-                                out_header=out_header,
-                                src_dim_names=src_dim_names,
-                                tree_id=mask.tree_id,
-                                stem_id=mask.stem_id,
-                            )
-                            las_writers[(mask.tree_id, mask.stem_id)].write_points(rec)
 
                         if write_ply:
                             recs = np.zeros(sel_count, dtype=ply_dtype)
@@ -1182,7 +1194,7 @@ def main() -> None:
     elapsed = time.time() - start_time
     stage(f"Done in {elapsed:.2f}s. Scanned {total_points} points; assigned {assigned_points}.")
     if write_las:
-        stage(f"Wrote LAS/LAZ outputs to: {out_dir}")
+        stage("Wrote masked LAS/LAZ outputs: " + ", ".join(str(p) for p in las_output_paths))
     if write_ply:
         stage(f"Wrote per-mask PLY outputs to: {out_dir}")
 
@@ -1191,35 +1203,26 @@ def main() -> None:
             stage("Debug QC plots require PLY outputs. Re-run without --ids-only.")
             return
 
-        stage("Generating QC plots for assigned masks")
-        mask_paths = [m.ply_out for m in masks if m.ply_out is not None and m.ply_out.exists()]
-        plot_match_distance = (
-            float(args.plot_match_distance) if args.plot_match_distance is not None else float(args.distance)
-        )
+        stage("Generating QC plots for input-mask vs output-mask overlays")
         debug_settings = {
             "target": str(args.target),
             "plot_count": int(args.plot_count),
             "plot_seed": int(args.plot_seed),
-            "plot_match_distance": float(plot_match_distance),
-            "plot_target_max_points": int(args.plot_target_max_points),
             "plot_mask_max_points": int(args.plot_mask_max_points),
             "plot_voxel_size": float(args.plot_voxel_size),
-            "sample_chunk_size": int(args.chunk_size),
+            "show_hull_outline": bool(args.hull_fill),
         }
         selection_state_path = out_dir / "qc_plots" / "debug_selection.json"
 
         try:
             qc_stats, qc_selected_masks, qc_selection_reused = generate_qc_plots(
-                mask_paths=[p for p in mask_paths if p is not None],
-                target_files=target_files,
+                masks=masks,
                 out_dir=out_dir,
                 rng_seed=args.plot_seed,
                 count=args.plot_count,
-                match_dist=plot_match_distance,
-                target_plot_max_points=args.plot_target_max_points,
                 mask_plot_max_points=args.plot_mask_max_points,
-                sample_chunk_size=args.chunk_size,
                 plot_voxel_size=args.plot_voxel_size,
+                show_hull_outline=bool(args.hull_fill),
                 selection_state_path=selection_state_path,
                 debug_settings=debug_settings,
             )
