@@ -3,11 +3,12 @@ channels:
   - conda-forge
   - defaults
 dependencies:
-  - python=3.11
+  - python=3.9
   - pip
   - numpy
   - scipy
   - pip:
     - plyfile
     - tqdm
+    - open3d
     - laspy[lazrs]  # Includes the Rust backend for fast LAZ compression
