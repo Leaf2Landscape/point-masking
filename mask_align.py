@@ -3,6 +3,7 @@ import argparse
 import csv
 import json
 import random
+import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -13,6 +14,23 @@ from scipy.spatial import cKDTree
 from tqdm import tqdm
 
 SUPPORTED_EXTS = {".ply", ".las", ".laz"}
+PROGRESS_KW = {
+    "leave": False,
+    "mininterval": 0.5,
+    "dynamic_ncols": True,
+    "disable": not sys.stderr.isatty(),
+}
+
+
+def stage(msg: str) -> None:
+    print(f"[align] {msg}")
+
+
+def normalize_cli_path(path: Path, must_exist: bool) -> Path:
+    p = path.expanduser()
+    if not p.is_absolute():
+        p = (Path.cwd() / p)
+    return p.resolve(strict=must_exist)
 
 
 def list_point_files(folder: Path) -> List[Path]:
@@ -76,12 +94,17 @@ def capped_voxel_sample(
     voxel_size: float,
     max_points: int,
     transform: Optional[np.ndarray] = None,
+    progress_desc: Optional[str] = None,
 ) -> np.ndarray:
     """Collect a memory-capped sample with per-chunk voxel thinning."""
     kept: List[np.ndarray] = []
     total_kept = 0
 
-    for path in files:
+    file_iter: Iterable[Path] = files
+    if progress_desc is not None:
+        file_iter = tqdm(files, desc=progress_desc, unit="file", **PROGRESS_KW)
+
+    for path in file_iter:
         for pts in iter_points(path, chunk_size):
             if transform is not None:
                 pts = apply_transform(pts, transform)
@@ -308,251 +331,13 @@ def project_aerial(points: np.ndarray) -> np.ndarray:
 def bbox_corners(mins: np.ndarray, maxs: np.ndarray) -> np.ndarray:
     return np.array(
         [
-            [mins[0], mins[1], mins[2]],
-            [mins[0], mins[1], maxs[2]],
-            [mins[0], maxs[1], mins[2]],
-            [mins[0], maxs[1], maxs[2]],
             [maxs[0], mins[1], mins[2]],
-            [maxs[0], mins[1], maxs[2]],
-            [maxs[0], maxs[1], mins[2]],
-            [maxs[0], maxs[1], maxs[2]],
         ],
-        dtype=np.float64,
-    )
-
-
-def sample_points_from_file(path: Path, chunk_size: int, max_points: int) -> np.ndarray:
-    """Memory-capped deterministic sampling from one file."""
     chunks: List[np.ndarray] = []
-    kept = 0
-    for pts in iter_points(path, chunk_size):
-        room = max_points - kept
-        if room <= 0:
-            break
-        if pts.shape[0] > room:
-            pick = np.linspace(0, pts.shape[0] - 1, num=room, dtype=np.int64)
-            pts = pts[pick]
-        chunks.append(pts)
-        kept += pts.shape[0]
-    if not chunks:
-        return np.empty((0, 3), dtype=np.float64)
-    return np.vstack(chunks)
-
-
 def _scatter_view(
-    ax,
-    title: str,
-    tgt_matched: np.ndarray,
-    tgt_unmatched: np.ndarray,
-    mask_unmatched: np.ndarray,
-    proj_fn,
-    xlim: Optional[Tuple[float, float]] = None,
-    ylim: Optional[Tuple[float, float]] = None,
-):
-    if tgt_unmatched.shape[0] > 0:
-        p = proj_fn(tgt_unmatched)
-        ax.scatter(p[:, 0], p[:, 1], s=1.0, c="black", alpha=0.55, linewidths=0)
-    if tgt_matched.shape[0] > 0:
-        p = proj_fn(tgt_matched)
-        ax.scatter(p[:, 0], p[:, 1], s=1.2, c="#22c55e", alpha=0.75, linewidths=0)
-    if mask_unmatched.shape[0] > 0:
-        p = proj_fn(mask_unmatched)
         ax.scatter(p[:, 0], p[:, 1], s=1.8, c="#ef4444", alpha=0.85, linewidths=0)
 
-    ax.set_title(title, fontsize=10)
-    ax.set_aspect("equal", adjustable="box")
-    ax.grid(False)
-    if xlim is not None:
-        ax.set_xlim(xlim)
-    if ylim is not None:
-        ax.set_ylim(ylim)
-
-
-def _extract_plot_sets(
-    mask_pts: np.ndarray,
-    target_points: np.ndarray,
-    match_dist: float,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    mins = np.min(mask_pts, axis=0)
-    maxs = np.max(mask_pts, axis=0)
-    pad = float(match_dist)
-    in_bbox = np.all((target_points >= (mins - pad)) & (target_points <= (maxs + pad)), axis=1)
-    target_local = target_points[in_bbox]
-
-    if target_local.shape[0] == 0:
-        return target_local, target_local, mask_pts, mins, maxs
-
-    mask_tree = cKDTree(mask_pts)
-    d_tgt, _ = mask_tree.query(target_local, k=1, workers=1)
-    tgt_matched = target_local[d_tgt <= match_dist]
-    tgt_unmatched = target_local[d_tgt > match_dist]
-
-    tgt_tree = cKDTree(target_local)
-    d_mask, _ = tgt_tree.query(mask_pts, k=1, workers=1)
-    mask_unmatched = mask_pts[d_mask > match_dist]
-
-    return tgt_matched, tgt_unmatched, mask_unmatched, mins, maxs
-
-
-def generate_qc_plots(
-    transformed_mask_paths: List[Path],
-    target_file: Path,
-    out_dir: Path,
-    rng_seed: int,
-    count: int,
-    match_dist: float,
-    target_plot_max_points: int,
-    mask_plot_max_points: int,
-    sample_chunk_size: int,
-    plot_voxel_size: float,
-) -> List[Dict[str, object]]:
-    try:
-        import matplotlib.pyplot as plt
-    except Exception as e:
-        raise RuntimeError(
             "matplotlib is required for QC plot generation. Install matplotlib and rerun."
-        ) from e
-
-    if not transformed_mask_paths:
-        return []
-
-    rng = random.Random(rng_seed)
-    n_pick = min(int(count), len(transformed_mask_paths))
-    chosen = rng.sample(transformed_mask_paths, n_pick)
-
-    print("Sampling target for QC plots...")
-    target_plot_points = capped_voxel_sample(
-        [target_file],
-        chunk_size=sample_chunk_size,
-        voxel_size=plot_voxel_size,
-        max_points=target_plot_max_points,
-        transform=None,
-    )
-    if target_plot_points.shape[0] == 0:
-        raise RuntimeError("Could not sample target points for QC plots")
-
-    plot_dir = out_dir / "qc_plots"
-    plot_dir.mkdir(parents=True, exist_ok=True)
-
-    per_mask_stats: List[Dict[str, object]] = []
-    overview_data: List[Tuple[str, np.ndarray, np.ndarray, np.ndarray]] = []
-
-    for mask_path in chosen:
-        mask_pts = sample_points_from_file(mask_path, sample_chunk_size, mask_plot_max_points)
-        if mask_pts.shape[0] == 0:
-            continue
-
-        tgt_match, tgt_unmatch, mask_unmatch, mins, maxs = _extract_plot_sets(
-            mask_pts=mask_pts,
-            target_points=target_plot_points,
-            match_dist=match_dist,
-        )
-
-        fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), dpi=180)
-
-        _scatter_view(
-            axes[0],
-            "Top (XY)",
-            tgt_match,
-            tgt_unmatch,
-            mask_unmatch,
-            project_top,
-            xlim=(float(mins[0]), float(maxs[0])),
-            ylim=(float(mins[1]), float(maxs[1])),
-        )
-        _scatter_view(
-            axes[1],
-            "Front (XZ)",
-            tgt_match,
-            tgt_unmatch,
-            mask_unmatch,
-            project_front,
-            xlim=(float(mins[0]), float(maxs[0])),
-            ylim=(float(mins[2]), float(maxs[2])),
-        )
-
-        corners = bbox_corners(mins, maxs)
-        ac = project_aerial(corners)
-        _scatter_view(
-            axes[2],
-            "Aerial (Oblique)",
-            tgt_match,
-            tgt_unmatch,
-            mask_unmatch,
-            project_aerial,
-            xlim=(float(np.min(ac[:, 0])), float(np.max(ac[:, 0]))),
-            ylim=(float(np.min(ac[:, 1])), float(np.max(ac[:, 1]))),
-        )
-
-        fig.suptitle(
-            f"Mask {mask_path.name} | green=target matched | black=target unmatched | red=mask unmatched",
-            fontsize=11,
-        )
-        fig.tight_layout()
-
-        fig_path = plot_dir / f"{mask_path.stem}_views.png"
-        fig.savefig(fig_path, bbox_inches="tight")
-        plt.close(fig)
-
-        overview_data.append((mask_path.name, tgt_match, tgt_unmatch, mask_unmatch))
-        per_mask_stats.append(
-            {
-                "mask_file": mask_path.name,
-                "plot_path": str(fig_path),
-                "target_points_in_bbox": int(tgt_match.shape[0] + tgt_unmatch.shape[0]),
-                "target_matched": int(tgt_match.shape[0]),
-                "target_unmatched": int(tgt_unmatch.shape[0]),
-                "mask_unmatched": int(mask_unmatch.shape[0]),
-            }
-        )
-
-    if overview_data:
-        fig, axes = plt.subplots(2, 2, figsize=(12, 12), dpi=180)
-        axes = axes.ravel()
-        for i, ax in enumerate(axes):
-            if i >= len(overview_data):
-                ax.axis("off")
-                continue
-            name, tgt_match, tgt_unmatch, mask_unmatch = overview_data[i]
-            _scatter_view(
-                ax,
-                f"{name} (Aerial)",
-                tgt_match,
-                tgt_unmatch,
-                mask_unmatch,
-                project_aerial,
-            )
-        fig.suptitle(
-            "QC sample (2x2): green=target matched | black=target unmatched | red=mask unmatched",
-            fontsize=12,
-        )
-        fig.tight_layout()
-        grid_path = plot_dir / "qc_overview_2x2.png"
-        fig.savefig(grid_path, bbox_inches="tight")
-        plt.close(fig)
-
-    return per_mask_stats
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser(
-        description="Align combined masks to target with optional DAT coarse transform + ICP, then write transformed masks."
-    )
-    ap.add_argument("target_file", type=Path, help="Target LAS/LAZ/PLY file used as ICP reference")
-    ap.add_argument("mask_dir", type=Path, help="Directory containing mask files (.ply/.las/.laz)")
-    ap.add_argument(
-        "--dat_transform",
-        type=Path,
-        default=None,
-        help="Optional DAT file with a 4x4 coarse transform matrix applied before ICP",
-    )
-    ap.add_argument(
-        "--output_dir",
-        type=Path,
-        default=None,
-        help="Output directory for transformed masks (default: <mask_dir>/transformed_to_target)",
-    )
-    ap.add_argument(
         "--voxel_size",
         type=float,
         default=0.10,
@@ -641,12 +426,14 @@ def main() -> None:
         action="store_true",
         help="Enable debug outputs (QC plots). By default, plots are not generated.",
     )
-    ap.add_argument(
-        "--reuse-existing-masks",
-        action="store_true",
-        help="Reuse previously transformed masks in output_dir when available.",
-    )
     args = ap.parse_args()
+
+    args.target_file = normalize_cli_path(args.target_file, must_exist=True)
+    args.mask_dir = normalize_cli_path(args.mask_dir, must_exist=True)
+    if args.dat_transform is not None:
+        args.dat_transform = normalize_cli_path(args.dat_transform, must_exist=True)
+    if args.output_dir is not None:
+        args.output_dir = normalize_cli_path(args.output_dir, must_exist=False)
 
     if not args.target_file.exists() or args.target_file.suffix.lower() not in SUPPORTED_EXTS:
         raise SystemExit("target_file must exist and be .ply/.las/.laz")
@@ -674,122 +461,88 @@ def main() -> None:
     report_path = out_dir / "icp_report.json"
     summary_csv_path = out_dir / "icp_summary.csv"
 
-    transformed_paths = [out_dir / p.name for p in mask_files]
-    can_reuse_masks = all(p.exists() for p in transformed_paths)
-    reuse_mode = bool(args.reuse_existing_masks and can_reuse_masks and matrix_path.exists())
-
     coarse = np.eye(4, dtype=np.float64)
-    icp: Dict[str, object]
-    icp_transform = np.eye(4, dtype=np.float64)
-    final_transform = np.eye(4, dtype=np.float64)
-    residuals: Dict[str, float]
+    if args.dat_transform is not None:
+        coarse = read_dat_matrix(args.dat_transform)
+
+    stage("Sampling target point cloud for ICP")
+    target_sample = capped_voxel_sample(
+        [args.target_file],
+        chunk_size=args.sample_chunk_size,
+        voxel_size=args.voxel_size,
+        max_points=args.max_points_target,
+        transform=None,
+        progress_desc="Sample target",
+    )
+    if target_sample.shape[0] < 1000:
+        raise SystemExit("Insufficient target sample points for ICP")
+
+    stage("Sampling combined masks for ICP")
+    mask_sample = capped_voxel_sample(
+        mask_files,
+        chunk_size=args.sample_chunk_size,
+        voxel_size=args.voxel_size,
+        max_points=args.max_points_masks,
+        transform=coarse,
+        progress_desc="Sample masks",
+    )
+    if mask_sample.shape[0] < 1000:
+        raise SystemExit("Insufficient mask sample points for ICP")
+
+    stage(
+        f"Running ICP on sampled sets: source={mask_sample.shape[0]}, target={target_sample.shape[0]}"
+    )
+    icp = run_icp(
+        source=mask_sample,
+        target=target_sample,
+        init_transform=np.eye(4, dtype=np.float64),
+        threshold=args.icp_threshold,
+        max_iter=args.icp_max_iter,
+        tol=args.icp_tol,
+    )
+
+    icp_transform = np.asarray(icp["transform"], dtype=np.float64)
+    final_transform = icp_transform @ coarse
+
+    aligned_mask_sample = apply_transform(mask_sample, icp_transform)
+    residuals: Dict[str, float] = compute_residual_summary(aligned_mask_sample, target_sample)
+
+    stage("Writing transformed masks")
     file_report: List[Dict[str, object]] = []
-
-    if reuse_mode:
-        print("Reusing existing transformed masks and transform matrix from output_dir...")
-        final_transform = read_dat_matrix(matrix_path)
-        for p in transformed_paths:
-            file_report.append({"file": p.name, "output": str(p), "points": -1})
-
-        if report_path.exists():
-            try:
-                old_report = json.loads(report_path.read_text(encoding="utf-8"))
-            except Exception:
-                old_report = {}
+    for src_path in tqdm(mask_files, desc="Write transformed masks", unit="file", **PROGRESS_KW):
+        dst_path = out_dir / src_path.name
+        ext = src_path.suffix.lower()
+        if ext in (".las", ".laz"):
+            npts = transform_las_like(src_path, dst_path, final_transform, args.write_chunk_size)
+        elif ext == ".ply":
+            npts = transform_ply(src_path, dst_path, final_transform)
         else:
-            old_report = {}
+            continue
+        file_report.append({"file": src_path.name, "output": str(dst_path), "points": int(npts)})
 
-        icp = {
-            "backend": old_report.get("backend", "reused"),
-            "fitness": float(old_report.get("icp_fitness", float("nan"))),
-            "inlier_rmse": float(old_report.get("icp_inlier_rmse", float("nan"))),
-            "iterations": int(old_report.get("icp_iterations", 0)),
-            "transform": np.asarray(old_report.get("icp_transform", np.eye(4)), dtype=np.float64),
-        }
-        if np.asarray(icp["transform"]).shape == (4, 4):
-            icp_transform = np.asarray(icp["transform"], dtype=np.float64)
-        else:
-            icp_transform = np.eye(4, dtype=np.float64)
-
-        residuals = old_report.get("residual_summary", None)
-        if not isinstance(residuals, dict):
-            residuals = {
-                "mean": float("nan"),
-                "median": float("nan"),
-                "p90": float("nan"),
-                "p95": float("nan"),
-                "p99": float("nan"),
-                "max": float("nan"),
-            }
-    else:
-        if args.reuse_existing_masks and not reuse_mode:
-            print("Reuse requested, but existing transformed masks/transform were incomplete. Running full alignment.")
-
-        if args.dat_transform is not None:
-            coarse = read_dat_matrix(args.dat_transform)
-
-        print("Sampling target point cloud for ICP...")
-        target_sample = capped_voxel_sample(
-            [args.target_file],
-            chunk_size=args.sample_chunk_size,
-            voxel_size=args.voxel_size,
-            max_points=args.max_points_target,
-            transform=None,
-        )
-        if target_sample.shape[0] < 1000:
-            raise SystemExit("Insufficient target sample points for ICP")
-
-        print("Sampling combined masks for ICP...")
-        mask_sample = capped_voxel_sample(
-            mask_files,
-            chunk_size=args.sample_chunk_size,
-            voxel_size=args.voxel_size,
-            max_points=args.max_points_masks,
-            transform=coarse,
-        )
-        if mask_sample.shape[0] < 1000:
-            raise SystemExit("Insufficient mask sample points for ICP")
-
-        print(
-            f"Running ICP on sampled sets: source={mask_sample.shape[0]}, target={target_sample.shape[0]}"
-        )
-        icp = run_icp(
-            source=mask_sample,
-            target=target_sample,
-            init_transform=np.eye(4, dtype=np.float64),
-            threshold=args.icp_threshold,
-            max_iter=args.icp_max_iter,
-            tol=args.icp_tol,
-        )
-
-        icp_transform = np.asarray(icp["transform"], dtype=np.float64)
-        final_transform = icp_transform @ coarse
-
-        aligned_mask_sample = apply_transform(mask_sample, icp_transform)
-        residuals = compute_residual_summary(aligned_mask_sample, target_sample)
-
-        print("Writing transformed masks...")
-        for src_path in tqdm(mask_files, unit="file"):
-            dst_path = out_dir / src_path.name
-            ext = src_path.suffix.lower()
-            if ext in (".las", ".laz"):
-                npts = transform_las_like(src_path, dst_path, final_transform, args.write_chunk_size)
-            elif ext == ".ply":
-                npts = transform_ply(src_path, dst_path, final_transform)
-            else:
-                continue
-            file_report.append({"file": src_path.name, "output": str(dst_path), "points": int(npts)})
-
-        write_dat_matrix(matrix_path, final_transform)
+    write_dat_matrix(matrix_path, final_transform)
     plot_match_distance = float(args.plot_match_distance) if args.plot_match_distance is not None else float(args.icp_threshold)
 
     transformed_paths = [out_dir / p.name for p in mask_files if (out_dir / p.name).exists()]
     if not transformed_paths:
         transformed_paths = [out_dir / row["file"] for row in file_report]
     qc_stats: List[Dict[str, object]] = []
+    qc_selected_masks: List[str] = []
+    qc_selection_reused = False
     if args.debug and args.plot_count > 0:
-        print("Generating QC plots...")
-        qc_stats = generate_qc_plots(
+        stage("Generating QC plots")
+        debug_settings = {
+            "target_file": str(args.target_file),
+            "plot_count": int(args.plot_count),
+            "plot_seed": int(args.plot_seed),
+            "plot_match_distance": float(plot_match_distance),
+            "plot_target_max_points": int(args.plot_target_max_points),
+            "plot_mask_max_points": int(args.plot_mask_max_points),
+            "plot_voxel_size": float(args.plot_voxel_size),
+            "sample_chunk_size": int(args.sample_chunk_size),
+        }
+        selection_state_path = out_dir / "qc_plots" / "debug_selection.json"
+        qc_stats, qc_selected_masks, qc_selection_reused = generate_qc_plots(
             transformed_mask_paths=transformed_paths,
             target_file=args.target_file,
             out_dir=out_dir,
@@ -800,9 +553,11 @@ def main() -> None:
             mask_plot_max_points=args.plot_mask_max_points,
             sample_chunk_size=args.sample_chunk_size,
             plot_voxel_size=args.plot_voxel_size,
+            selection_state_path=selection_state_path,
+            debug_settings=debug_settings,
         )
     elif not args.debug:
-        print("Debug mode off; skipping QC plot generation.")
+        stage("Debug mode off; skipping QC plot generation")
 
     summary_row = {
         "target_file": str(args.target_file),
@@ -819,11 +574,12 @@ def main() -> None:
         "residual_p99": residuals["p99"],
         "residual_max": residuals["max"],
         "masks_written": len(file_report),
-        "points_written": int(sum(int(r["points"]) for r in file_report if int(r["points"]) >= 0)),
-        "reuse_existing_masks": bool(reuse_mode),
+        "points_written": int(sum(int(r["points"]) for r in file_report)),
         "debug": bool(args.debug),
         "qc_plot_count": int(len(qc_stats)),
         "qc_plot_match_distance": plot_match_distance,
+        "qc_selection_reused": bool(qc_selection_reused),
+        "qc_selected_masks": ";".join(qc_selected_masks),
     }
     with open(summary_csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(summary_row.keys()))
@@ -848,19 +604,21 @@ def main() -> None:
         "final_transform": final_transform.tolist(),
         "residual_summary": residuals,
         "files_written": file_report,
-        "reuse_existing_masks": bool(reuse_mode),
         "debug": bool(args.debug),
         "summary_csv": str(summary_csv_path),
         "qc_plot_match_distance": plot_match_distance,
+        "qc_selection_reused": bool(qc_selection_reused),
+        "qc_selected_masks": qc_selected_masks,
+        "qc_selection_state_path": str(out_dir / "qc_plots" / "debug_selection.json"),
         "qc_plots": qc_stats,
     }
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-    print("Done.")
-    print(f"Transformed masks: {out_dir}")
-    print(f"Final transform DAT: {matrix_path}")
-    print(f"ICP summary CSV: {summary_csv_path}")
-    print(f"ICP report: {report_path}")
+    stage("Done")
+    stage(f"Transformed masks: {out_dir}")
+    stage(f"Final transform DAT: {matrix_path}")
+    stage(f"ICP summary CSV: {summary_csv_path}")
+    stage(f"ICP report: {report_path}")
 
 
 if __name__ == "__main__":
