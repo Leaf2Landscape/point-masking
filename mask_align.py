@@ -2,16 +2,16 @@
 import argparse
 import csv
 import json
-import random
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional
 
 import laspy
 import numpy as np
 from plyfile import PlyData, PlyElement
 from scipy.spatial import cKDTree
 from tqdm import tqdm
+
 
 SUPPORTED_EXTS = {".ply", ".las", ".laz"}
 PROGRESS_KW = {
@@ -29,7 +29,7 @@ def stage(msg: str) -> None:
 def normalize_cli_path(path: Path, must_exist: bool) -> Path:
     p = path.expanduser()
     if not p.is_absolute():
-        p = (Path.cwd() / p)
+        p = Path.cwd() / p
     return p.resolve(strict=must_exist)
 
 
@@ -72,8 +72,7 @@ def apply_transform(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
 
 
 def read_dat_matrix(path: Path) -> np.ndarray:
-    text = path.read_text(encoding="utf-8")
-    text = text.replace(",", " ")
+    text = path.read_text(encoding="utf-8").replace(",", " ")
     vals = np.fromstring(text, sep=" ", dtype=np.float64)
     if vals.size != 16:
         raise ValueError(f"Expected 16 numeric values in DAT transform, found {vals.size}")
@@ -96,7 +95,6 @@ def capped_voxel_sample(
     transform: Optional[np.ndarray] = None,
     progress_desc: Optional[str] = None,
 ) -> np.ndarray:
-    """Collect a memory-capped sample with per-chunk voxel thinning."""
     kept: List[np.ndarray] = []
     total_kept = 0
 
@@ -110,9 +108,9 @@ def capped_voxel_sample(
                 pts = apply_transform(pts, transform)
 
             if voxel_size > 0:
-                voxel_idx = np.floor(pts / voxel_size).astype(np.int64)
-                _, unique_local = np.unique(voxel_idx, axis=0, return_index=True)
-                pts = pts[np.sort(unique_local)]
+                vox = np.floor(pts / voxel_size).astype(np.int64)
+                _, idx = np.unique(vox, axis=0, return_index=True)
+                pts = pts[np.sort(idx)]
 
             if pts.shape[0] == 0:
                 continue
@@ -139,20 +137,17 @@ def capped_voxel_sample(
 def rigid_transform_kabsch(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
     src_centroid = np.mean(src, axis=0)
     dst_centroid = np.mean(dst, axis=0)
+    src_c = src - src_centroid
+    dst_c = dst - dst_centroid
 
-    src_centered = src - src_centroid
-    dst_centered = dst - dst_centroid
-
-    h = src_centered.T @ dst_centered
+    h = src_c.T @ dst_c
     u, _, vt = np.linalg.svd(h)
     r = vt.T @ u.T
-
     if np.linalg.det(r) < 0:
         vt[-1, :] *= -1
         r = vt.T @ u.T
 
     t = dst_centroid - r @ src_centroid
-
     out = np.eye(4, dtype=np.float64)
     out[:3, :3] = r
     out[:3, 3] = t
@@ -180,13 +175,11 @@ def run_icp_scipy(
         src_t = apply_transform(source, tform)
         dists, nn_idx = target_tree.query(src_t, k=1, workers=1)
         inlier = dists <= threshold
-
         if np.count_nonzero(inlier) < 3:
             break
 
         src_in = src_t[inlier]
         dst_in = target[nn_idx[inlier]]
-
         delta = rigid_transform_kabsch(src_in, dst_in)
         tform = delta @ tform
 
@@ -200,7 +193,6 @@ def run_icp_scipy(
     inlier = dists <= threshold
     fitness = float(np.count_nonzero(inlier) / max(1, source.shape[0]))
     rmse = float(np.sqrt(np.mean(dists[inlier] ** 2))) if np.any(inlier) else float("nan")
-
     return {
         "backend": "scipy",
         "transform": tform,
@@ -223,7 +215,6 @@ def run_icp(
 
         src_pc = o3d.geometry.PointCloud()
         src_pc.points = o3d.utility.Vector3dVector(source)
-
         tgt_pc = o3d.geometry.PointCloud()
         tgt_pc.points = o3d.utility.Vector3dVector(target)
 
@@ -232,7 +223,6 @@ def run_icp(
             relative_fitness=tol,
             relative_rmse=tol,
         )
-
         reg = o3d.pipelines.registration.registration_icp(
             src_pc,
             tgt_pc,
@@ -241,7 +231,6 @@ def run_icp(
             o3d.pipelines.registration.TransformationEstimationPointToPoint(),
             criteria,
         )
-
         return {
             "backend": "open3d",
             "transform": np.asarray(reg.transformation, dtype=np.float64),
@@ -308,36 +297,32 @@ def transform_ply(in_path: Path, out_path: Path, transform: np.ndarray) -> int:
     out_vertex["x"] = xyz_t[:, 0]
     out_vertex["y"] = xyz_t[:, 1]
     out_vertex["z"] = xyz_t[:, 2]
-
     PlyData([PlyElement.describe(out_vertex, "vertex")], text=False).write(out_path)
     return out_vertex.shape[0]
 
 
-def project_top(points: np.ndarray) -> np.ndarray:
-    return points[:, [0, 1]]
-
-
-def project_front(points: np.ndarray) -> np.ndarray:
-    return points[:, [0, 2]]
-
-
-def project_aerial(points: np.ndarray) -> np.ndarray:
-    # Oblique "down-angle from side" projection.
-    x = points[:, 0] + 0.35 * points[:, 1]
-    y = points[:, 2] - 0.25 * points[:, 1]
-    return np.column_stack((x, y))
-
-
-def bbox_corners(mins: np.ndarray, maxs: np.ndarray) -> np.ndarray:
-    return np.array(
-        [
-            [maxs[0], mins[1], mins[2]],
-        ],
-    chunks: List[np.ndarray] = []
-def _scatter_view(
-        ax.scatter(p[:, 0], p[:, 1], s=1.8, c="#ef4444", alpha=0.85, linewidths=0)
-
-            "matplotlib is required for QC plot generation. Install matplotlib and rerun."
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description=(
+            "Align combined masks to a target cloud using optional DAT coarse transform + ICP; "
+            "write transformed masks and reports."
+        )
+    )
+    ap.add_argument("target_file", type=Path, help="Target cloud file (.ply/.las/.laz)")
+    ap.add_argument("mask_dir", type=Path, help="Directory of mask files to align")
+    ap.add_argument(
+        "--dat_transform",
+        type=Path,
+        default=None,
+        help="Optional 4x4 DAT matrix applied to masks before ICP",
+    )
+    ap.add_argument(
+        "--output_dir",
+        type=Path,
+        default=None,
+        help="Output directory (default: mask_dir/transformed_to_target)",
+    )
+    ap.add_argument(
         "--voxel_size",
         type=float,
         default=0.10,
@@ -385,47 +370,6 @@ def _scatter_view(
         default=1e-6,
         help="ICP convergence tolerance (default: 1e-6)",
     )
-    ap.add_argument(
-        "--plot_count",
-        type=int,
-        default=4,
-        help="Number of random transformed masks to plot for QC (default: 4, debug only)",
-    )
-    ap.add_argument(
-        "--plot_seed",
-        type=int,
-        default=42,
-        help="Random seed for selecting QC masks (default: 42)",
-    )
-    ap.add_argument(
-        "--plot_match_distance",
-        type=float,
-        default=None,
-        help="Match threshold for QC plot coloring (default: --icp_threshold)",
-    )
-    ap.add_argument(
-        "--plot_target_max_points",
-        type=int,
-        default=300000,
-        help="Max target points sampled for QC plots (default: 300000)",
-    )
-    ap.add_argument(
-        "--plot_mask_max_points",
-        type=int,
-        default=120000,
-        help="Max transformed-mask points sampled per QC plot (default: 120000)",
-    )
-    ap.add_argument(
-        "--plot_voxel_size",
-        type=float,
-        default=0.10,
-        help="Voxel size for target sampling during QC plots (default: 0.10)",
-    )
-    ap.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug outputs (QC plots). By default, plots are not generated.",
-    )
     args = ap.parse_args()
 
     args.target_file = normalize_cli_path(args.target_file, must_exist=True)
@@ -435,20 +379,16 @@ def _scatter_view(
     if args.output_dir is not None:
         args.output_dir = normalize_cli_path(args.output_dir, must_exist=False)
 
-    if not args.target_file.exists() or args.target_file.suffix.lower() not in SUPPORTED_EXTS:
-        raise SystemExit("target_file must exist and be .ply/.las/.laz")
-    if not args.mask_dir.exists() or not args.mask_dir.is_dir():
-        raise SystemExit("mask_dir must exist and be a directory")
+    if args.target_file.suffix.lower() not in SUPPORTED_EXTS:
+        raise SystemExit("target_file must be .ply/.las/.laz")
+    if not args.mask_dir.is_dir():
+        raise SystemExit("mask_dir must be a directory")
     if args.voxel_size <= 0:
         raise SystemExit("--voxel_size must be > 0")
     if args.max_points_target < 1000 or args.max_points_masks < 1000:
         raise SystemExit("--max_points_target and --max_points_masks must be >= 1000")
-    if args.plot_count < 0:
-        raise SystemExit("--plot_count must be >= 0")
-    if args.plot_target_max_points < 1000 or args.plot_mask_max_points < 1000:
-        raise SystemExit("--plot_target_max_points and --plot_mask_max_points must be >= 1000")
-    if args.plot_voxel_size <= 0:
-        raise SystemExit("--plot_voxel_size must be > 0")
+    if args.sample_chunk_size <= 0 or args.write_chunk_size <= 0:
+        raise SystemExit("--sample_chunk_size and --write_chunk_size must be > 0")
 
     mask_files = list_point_files(args.mask_dir)
     if not mask_files:
@@ -521,43 +461,6 @@ def _scatter_view(
         file_report.append({"file": src_path.name, "output": str(dst_path), "points": int(npts)})
 
     write_dat_matrix(matrix_path, final_transform)
-    plot_match_distance = float(args.plot_match_distance) if args.plot_match_distance is not None else float(args.icp_threshold)
-
-    transformed_paths = [out_dir / p.name for p in mask_files if (out_dir / p.name).exists()]
-    if not transformed_paths:
-        transformed_paths = [out_dir / row["file"] for row in file_report]
-    qc_stats: List[Dict[str, object]] = []
-    qc_selected_masks: List[str] = []
-    qc_selection_reused = False
-    if args.debug and args.plot_count > 0:
-        stage("Generating QC plots")
-        debug_settings = {
-            "target_file": str(args.target_file),
-            "plot_count": int(args.plot_count),
-            "plot_seed": int(args.plot_seed),
-            "plot_match_distance": float(plot_match_distance),
-            "plot_target_max_points": int(args.plot_target_max_points),
-            "plot_mask_max_points": int(args.plot_mask_max_points),
-            "plot_voxel_size": float(args.plot_voxel_size),
-            "sample_chunk_size": int(args.sample_chunk_size),
-        }
-        selection_state_path = out_dir / "qc_plots" / "debug_selection.json"
-        qc_stats, qc_selected_masks, qc_selection_reused = generate_qc_plots(
-            transformed_mask_paths=transformed_paths,
-            target_file=args.target_file,
-            out_dir=out_dir,
-            rng_seed=args.plot_seed,
-            count=args.plot_count,
-            match_dist=plot_match_distance,
-            target_plot_max_points=args.plot_target_max_points,
-            mask_plot_max_points=args.plot_mask_max_points,
-            sample_chunk_size=args.sample_chunk_size,
-            plot_voxel_size=args.plot_voxel_size,
-            selection_state_path=selection_state_path,
-            debug_settings=debug_settings,
-        )
-    elif not args.debug:
-        stage("Debug mode off; skipping QC plot generation")
 
     summary_row = {
         "target_file": str(args.target_file),
@@ -575,11 +478,6 @@ def _scatter_view(
         "residual_max": residuals["max"],
         "masks_written": len(file_report),
         "points_written": int(sum(int(r["points"]) for r in file_report)),
-        "debug": bool(args.debug),
-        "qc_plot_count": int(len(qc_stats)),
-        "qc_plot_match_distance": plot_match_distance,
-        "qc_selection_reused": bool(qc_selection_reused),
-        "qc_selected_masks": ";".join(qc_selected_masks),
     }
     with open(summary_csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(summary_row.keys()))
@@ -604,13 +502,7 @@ def _scatter_view(
         "final_transform": final_transform.tolist(),
         "residual_summary": residuals,
         "files_written": file_report,
-        "debug": bool(args.debug),
         "summary_csv": str(summary_csv_path),
-        "qc_plot_match_distance": plot_match_distance,
-        "qc_selection_reused": bool(qc_selection_reused),
-        "qc_selected_masks": qc_selected_masks,
-        "qc_selection_state_path": str(out_dir / "qc_plots" / "debug_selection.json"),
-        "qc_plots": qc_stats,
     }
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
