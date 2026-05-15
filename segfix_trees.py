@@ -66,6 +66,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 SUPPORTED_EXTS = {'.ply', '.las', '.laz'}
 RESERVED_OUTPUT_FIELDS = {'x', 'y', 'z', 'current_id', 'match_flag', 'src'}
+PROGRESS_KW = {
+    'leave': False,
+    'mininterval': 0.5,
+    'dynamic_ncols': True,
+    'disable': not sys.stderr.isatty(),
+}
+
+
+def stage(msg: str) -> None:
+    print(f"[segfix] {msg}")
+
+
+def normalize_cli_path(path: Path, must_exist: bool) -> Path:
+    p = path.expanduser()
+    if not p.is_absolute():
+        p = (Path.cwd() / p)
+    return p.resolve(strict=must_exist)
 
 
 def _normalize_passthrough_dtype(src_dtype: np.dtype) -> np.dtype:
@@ -380,7 +397,7 @@ def build_mask_index(mask_paths: List[Path], hag_percentile: float,
     bboxes: List[Tuple[np.ndarray,np.ndarray]] = []
     it = mask_paths
     if verbose:
-        it = tqdm(it, desc='Loading masks', unit='mask')
+        it = tqdm(it, desc='Load masks', unit='mask', **PROGRESS_KW)
     for p in it:
         xyz = read_xyz(p)
         tree = build_tree_info(
@@ -492,6 +509,12 @@ def main():
 
     args = ap.parse_args()
 
+    args.input_folder = normalize_cli_path(args.input_folder, must_exist=True)
+    args.mask_dir = normalize_cli_path(args.mask_dir, must_exist=True)
+    args.output = normalize_cli_path(args.output, must_exist=False)
+    if args.report is not None:
+        args.report = normalize_cli_path(args.report, must_exist=False)
+
     out_dir = args.output
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -501,7 +524,7 @@ def main():
     if args.threads is None:
         import psutil
         args.threads = max(1, psutil.cpu_count(logical=True) // max(1, args.workers))
-    print(f"Using {args.workers} worker threads for target files, {args.threads} threads for KD queries.")
+    stage(f"Using {args.workers} worker threads for target files, {args.threads} threads for KD queries")
 
     target_files = list_point_files(args.input_folder)
     mask_files = list_point_files(args.mask_dir)
@@ -527,9 +550,9 @@ def main():
 
     passthrough_fields = infer_passthrough_fields(target_files)
     if passthrough_fields:
-        print('Passthrough fields:', ', '.join(name for name, _ in passthrough_fields))
+        stage('Passthrough fields: ' + ', '.join(name for name, _ in passthrough_fields))
     else:
-        print('Passthrough fields: none')
+        stage('Passthrough fields: none')
 
     out_dtype_fields: List[Tuple[str, str]] = [
         ('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
@@ -552,7 +575,7 @@ def main():
     for idx, target_path in enumerate(target_files, start=1):
         target_id_map[idx] = target_path.name
 
-    print(f'Processing {len(target_files)} target trees ...')
+    stage(f'Processing {len(target_files)} target trees')
     passthrough_copied = 0
     link_rows: List[List[object]] = []
 
@@ -720,7 +743,13 @@ def main():
 
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {executor.submit(process_target_file, p): p for p in target_files}
-        for future in tqdm(as_completed(futures), total=len(target_files), desc='Assigning target trees to masks', unit='tree'):
+        for future in tqdm(
+            as_completed(futures),
+            total=len(target_files),
+            desc='Assign trees',
+            unit='tree',
+            **PROGRESS_KW,
+        ):
             result = future.result()
             if result is None:
                 continue
@@ -850,14 +879,14 @@ def main():
                     if src.exists() and src != dst_path:
                         src.unlink()
 
-        print('Renamed/merged output files based on majority contributing target_id.')
+        stage('Renamed/merged output files based on majority contributing target_id')
 
-    print(f"Done. Wrote per-mask outputs to {out_dir}.")
+    stage(f"Done. Wrote per-mask outputs to {out_dir}")
     if passthrough_copied > 0:
-        print(f"Copied {passthrough_copied} target tree file(s) through to output.")
-    print(f"Target-ID map: {out_dir / 'current_id_map.csv'}")
-    print(f"Link report: {out_dir / 'link_report.csv'}")
-    print(f"Report: {report_path}")
+        stage(f"Copied {passthrough_copied} target tree file(s) through to output")
+    stage(f"Target-ID map: {out_dir / 'current_id_map.csv'}")
+    stage(f"Link report: {out_dir / 'link_report.csv'}")
+    stage(f"Report: {report_path}")
 
 if __name__ == '__main__':
     main()
