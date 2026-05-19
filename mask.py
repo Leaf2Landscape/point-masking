@@ -924,6 +924,11 @@ def main() -> None:
         help="Enable secondary hull-based inclusion for unmatched points",
     )
     parser.add_argument(
+        "--las_out",
+        action="store_true",
+        help="Save output as uncompressed .las instead of .laz (default: .laz)",
+    )
+    parser.add_argument(
         "--vox_mul",
         type=float,
         default=3.0,
@@ -1027,7 +1032,10 @@ def main() -> None:
     las_targets = [p for p in target_files if p.suffix.lower() in (".las", ".laz")]
     if write_las and not las_targets:
         raise SystemExit("LAS/LAZ output requested but no LAS/LAZ target inputs were provided")
-    las_suffix = ".laz" if any(p.suffix.lower() == ".laz" for p in las_targets) else ".las"
+    if args.las_out:
+        las_suffix = ".las"
+    else:
+        las_suffix = ".laz" if any(p.suffix.lower() == ".laz" for p in las_targets) else ".las"
 
     masks = load_masks(
         mask_folder=args.mask_folder,
