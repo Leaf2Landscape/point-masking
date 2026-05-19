@@ -668,9 +668,23 @@ def sample_points_array(points: np.ndarray, voxel_size: float, max_points: int) 
     return pts.astype(np.float32, copy=False)
 
 
+def subtract_exact_points(points: np.ndarray, remove: np.ndarray) -> np.ndarray:
+    if points.shape[0] == 0 or remove.shape[0] == 0:
+        return points
+
+    pts = np.ascontiguousarray(points.astype(np.float32, copy=False))
+    rem = np.ascontiguousarray(remove.astype(np.float32, copy=False))
+    row_dtype = np.dtype((np.void, pts.dtype.itemsize * pts.shape[1]))
+    pts_view = pts.view(row_dtype).ravel()
+    rem_view = rem.view(row_dtype).ravel()
+    keep = ~np.isin(pts_view, rem_view)
+    return pts[keep]
+
+
 def _scatter_compare_view(
     ax,
     title: str,
+    background_pts: np.ndarray,
     input_pts: np.ndarray,
     output_pts: np.ndarray,
     proj_fn,
@@ -678,6 +692,9 @@ def _scatter_compare_view(
     xlim=None,
     ylim=None,
 ) -> None:
+    if background_pts.shape[0] > 0:
+        p = proj_fn(background_pts)
+        ax.scatter(p[:, 0], p[:, 1], s=1.1, c="#000000", alpha=0.25, linewidths=0)
     if input_pts.shape[0] > 0:
         p = proj_fn(input_pts)
         ax.scatter(p[:, 0], p[:, 1], s=1.3, c="#2563eb", alpha=0.18, linewidths=0)
@@ -706,13 +723,16 @@ def _scatter_compare_view(
         ax.set_ylim(ylim)
 
 
-def _overlay_bounds(input_pts: np.ndarray, output_pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    if input_pts.shape[0] > 0 and output_pts.shape[0] > 0:
-        combined = np.vstack((input_pts, output_pts))
-    elif input_pts.shape[0] > 0:
-        combined = input_pts
+def _overlay_bounds(
+    background_pts: np.ndarray,
+    input_pts: np.ndarray,
+    output_pts: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    arrays = [arr for arr in (background_pts, input_pts, output_pts) if arr.shape[0] > 0]
+    if arrays:
+        combined = np.vstack(arrays)
     else:
-        combined = output_pts
+        combined = np.empty((0, 3), dtype=np.float32)
 
     if combined.shape[0] == 0:
         zeros = np.zeros(3, dtype=np.float32)
@@ -725,6 +745,7 @@ def generate_qc_plots(
     out_dir: Path,
     rng_seed: int,
     count: int,
+    target_plot_points: np.ndarray,
     mask_plot_max_points: int,
     plot_voxel_size: float,
     show_hull_outline: bool,
@@ -769,10 +790,15 @@ def generate_qc_plots(
     plot_dir.mkdir(parents=True, exist_ok=True)
 
     per_mask_stats: List[Dict[str, object]] = []
-    overview_data: List[Tuple[str, np.ndarray, np.ndarray, Optional[np.ndarray]]] = []
+    overview_data: List[Tuple[str, np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]] = []
 
     for mask in chosen:
         input_pts = sample_points_array(mask.points, plot_voxel_size, mask_plot_max_points)
+        mask_bbox_mins = np.min(mask.points, axis=0)
+        mask_bbox_maxs = np.max(mask.points, axis=0)
+        target_in_mask_box = target_plot_points[
+            np.all((target_plot_points >= mask_bbox_mins) & (target_plot_points <= mask_bbox_maxs), axis=1)
+        ]
         output_pts = np.empty((0, 3), dtype=np.float32)
         if mask.ply_out is not None and mask.ply_out.exists():
             output_pts = capped_voxel_sample(
@@ -782,14 +808,17 @@ def generate_qc_plots(
                 max_points=mask_plot_max_points,
             )
 
+        background_pts = subtract_exact_points(target_in_mask_box, output_pts)
+
         hull_pts = mask.hull.hull_points if show_hull_outline and mask.hull is not None else None
 
-        mins, maxs = _overlay_bounds(input_pts, output_pts)
+        mins, maxs = _overlay_bounds(background_pts, input_pts, output_pts)
 
         fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), dpi=180)
         _scatter_compare_view(
             axes[0],
             "Top (XY)",
+            background_pts,
             input_pts,
             output_pts,
             project_top,
@@ -800,6 +829,7 @@ def generate_qc_plots(
         _scatter_compare_view(
             axes[1],
             "Front (XZ)",
+            background_pts,
             input_pts,
             output_pts,
             project_front,
@@ -812,6 +842,7 @@ def generate_qc_plots(
         _scatter_compare_view(
             axes[2],
             "Aerial (Oblique)",
+            background_pts,
             input_pts,
             output_pts,
             project_aerial,
@@ -820,7 +851,7 @@ def generate_qc_plots(
             ylim=(float(np.min(ac[:, 1])), float(np.max(ac[:, 1]))),
         )
         fig.suptitle(
-            f"Mask {mask.tree_id}_{mask.stem_id} | blue=input mask | orange=output mask",
+            f"Mask {mask.tree_id}_{mask.stem_id} | black=other target | blue=input mask | orange=output mask",
             fontsize=11,
         )
         fig.tight_layout()
@@ -828,11 +859,12 @@ def generate_qc_plots(
         fig.savefig(fig_path, bbox_inches="tight")
         plt.close(fig)
 
-        overview_data.append((f"{mask.tree_id}_{mask.stem_id}", input_pts, output_pts, hull_pts))
+        overview_data.append((f"{mask.tree_id}_{mask.stem_id}", background_pts, input_pts, output_pts, hull_pts))
         per_mask_stats.append(
             {
                 "mask_file": f"{mask.tree_id}_{mask.stem_id}",
                 "plot_path": str(fig_path),
+                "background_points_sampled": int(background_pts.shape[0]),
                 "input_points_sampled": int(input_pts.shape[0]),
                 "output_points_sampled": int(output_pts.shape[0]),
             }
@@ -845,17 +877,18 @@ def generate_qc_plots(
             if i >= len(overview_data):
                 ax.axis("off")
                 continue
-            name, input_pts, output_pts, hull_pts = overview_data[i]
+            name, background_pts, input_pts, output_pts, hull_pts = overview_data[i]
             _scatter_compare_view(
                 ax,
                 f"{name} (Aerial)",
+                background_pts,
                 input_pts,
                 output_pts,
                 project_aerial,
                 hull_points=hull_pts,
             )
         fig.suptitle(
-            "QC sample (2x2): blue=input mask | orange=output mask",
+            "QC sample (2x2): black=other target | blue=input mask | orange=output mask",
             fontsize=12,
         )
         fig.tight_layout()
@@ -1212,10 +1245,17 @@ def main() -> None:
             return
 
         stage("Generating QC plots for input-mask vs output-mask overlays")
+        target_plot_points = capped_voxel_sample(
+            files=target_files,
+            chunk_size=args.chunk_size,
+            voxel_size=args.plot_voxel_size,
+            max_points=args.plot_target_max_points,
+        )
         debug_settings = {
             "target": str(args.target),
             "plot_count": int(args.plot_count),
             "plot_seed": int(args.plot_seed),
+            "plot_target_max_points": int(args.plot_target_max_points),
             "plot_mask_max_points": int(args.plot_mask_max_points),
             "plot_voxel_size": float(args.plot_voxel_size),
             "show_hull_outline": bool(args.hull_fill),
@@ -1228,6 +1268,7 @@ def main() -> None:
                 out_dir=out_dir,
                 rng_seed=args.plot_seed,
                 count=args.plot_count,
+                target_plot_points=target_plot_points,
                 mask_plot_max_points=args.plot_mask_max_points,
                 plot_voxel_size=args.plot_voxel_size,
                 show_hull_outline=bool(args.hull_fill),
