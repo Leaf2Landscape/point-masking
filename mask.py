@@ -159,6 +159,93 @@ class MaskRecord:
     ply_out: Optional[Path] = None
 
 
+@dataclass
+class FileMaskSource:
+    points: np.ndarray
+    tree: cKDTree
+    field_names: List[str]
+    field_arrays: Dict[str, np.ndarray]
+
+
+def _field_dtype(header: laspy.LasHeader, field_name: str) -> np.dtype:
+    dim_names = list(header.point_format.dimension_names)
+    if field_name in dim_names:
+        dim = header.point_format.dimension_by_name(field_name)
+        if dim.dtype is not None:
+            return np.dtype(dim.dtype)
+        # Bit-packed sub-fields (e.g. classification) report no scalar dtype; laspy
+        # unpacks them into the smallest unsigned int that fits num_bits.
+        for nbytes in (1, 2, 4, 8):
+            if dim.num_bits <= nbytes * 8:
+                return np.dtype(f"u{nbytes}")
+        return np.dtype(np.uint64)
+    for extra in header.point_format.extra_dimensions:
+        if extra.name == field_name:
+            return np.dtype(extra.dtype)
+    raise SystemExit(
+        f"Field '{field_name}' not found in mask file. Available dimensions: {', '.join(dim_names)}"
+    )
+
+
+def load_file_mask(
+    path: Path,
+    fields: List[str],
+    distance: float,
+    chunk_size: int,
+    mask_voxel_size: float,
+    fast_index_build: bool,
+) -> FileMaskSource:
+    with laspy.open(path) as src:
+        N = int(src.header.point_count)
+        xyz_buf = np.empty((N, 3), dtype=np.float32)
+        field_bufs = {f: np.empty(N, dtype=_field_dtype(src.header, f)) for f in fields}
+        offset = 0
+        for chunk in src.chunk_iterator(chunk_size):
+            n = len(chunk.x)
+            xyz_buf[offset:offset + n, 0] = chunk.x
+            xyz_buf[offset:offset + n, 1] = chunk.y
+            xyz_buf[offset:offset + n, 2] = chunk.z
+            for f in fields:
+                field_bufs[f][offset:offset + n] = np.asarray(getattr(chunk, f))
+            offset += n
+
+    if mask_voxel_size > 0:
+        vox = np.floor(xyz_buf / mask_voxel_size).astype(np.int64)
+        _, idx = np.unique(vox, axis=0, return_index=True)
+        idx = np.sort(idx)
+        xyz_buf = xyz_buf[idx]
+        for f in fields:
+            field_bufs[f] = field_bufs[f][idx]
+
+    tree = cKDTree(
+        xyz_buf,
+        leafsize=64,
+        compact_nodes=not fast_index_build,
+        balanced_tree=not fast_index_build,
+    )
+    return FileMaskSource(points=xyz_buf, tree=tree, field_names=fields, field_arrays=field_bufs)
+
+
+def assign_fields_for_chunk(
+    chunk_xyz: np.ndarray,
+    source: FileMaskSource,
+    distance: float,
+    query_workers: int,
+) -> Dict[str, np.ndarray]:
+    n = chunk_xyz.shape[0]
+    dists, idxs = source.tree.query(
+        chunk_xyz, k=1, distance_upper_bound=distance, workers=query_workers
+    )
+    matched = dists != np.inf
+    out: Dict[str, np.ndarray] = {}
+    for f in source.field_names:
+        arr = np.zeros(n, dtype=source.field_arrays[f].dtype)
+        if np.any(matched):
+            arr[matched] = source.field_arrays[f][idxs[matched]]
+        out[f] = arr
+    return out
+
+
 def build_mask_record(
     tree_id: int,
     stem_id: int,
@@ -584,6 +671,36 @@ def make_point_record_with_ids(
     return rec
 
 
+def build_las_header_with_fields(
+    src_header: laspy.LasHeader,
+    field_names: List[str],
+    field_dtypes: Dict[str, np.dtype],
+) -> laspy.LasHeader:
+    out_header = src_header.copy()
+    dim_names = set(out_header.point_format.dimension_names)
+    for f in field_names:
+        if f not in dim_names:
+            out_header.add_extra_dim(ExtraBytesParams(name=f, type=field_dtypes[f]))
+    return out_header
+
+
+def make_point_record_with_fields(
+    chunk_subset,
+    out_header: laspy.LasHeader,
+    src_dim_names: List[str],
+    field_value_arrays: Dict[str, np.ndarray],
+):
+    rec = ScaleAwarePointRecord.zeros(len(chunk_subset), header=out_header)
+    for dim in src_dim_names:
+        if dim in field_value_arrays:
+            continue
+        if hasattr(chunk_subset, dim):
+            setattr(rec, dim, np.asarray(getattr(chunk_subset, dim)))
+    for f in field_value_arrays:
+        setattr(rec, f, np.asarray(field_value_arrays[f]))
+    return rec
+
+
 def project_top(points: np.ndarray) -> np.ndarray:
     return points[:, [0, 1]]
 
@@ -903,7 +1020,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Extract points per mask id and write LAS/LAZ with IDs and/or per-mask PLY."
     )
-    parser.add_argument("-m", "--mask-folder", required=True, type=Path, help="Folder containing mask files")
+    parser.add_argument(
+        "-m",
+        "--mask",
+        required=True,
+        type=Path,
+        help="Folder containing mask files, or a single LAS/LAZ mask file",
+    )
+    parser.add_argument(
+        "--fields",
+        type=str,
+        default="tree_id,stem_id",
+        help="Comma-separated fields to transfer in single-file mask mode (default: tree_id,stem_id)",
+    )
+    parser.add_argument(
+        "--mask_voxel_size",
+        type=float,
+        default=0.0,
+        help="Voxel-downsample the single-file mask before building the KD-tree (default 0 = off)",
+    )
     parser.add_argument("-t", "--target", required=True, type=Path, help="Target LAS/LAZ/PLY file or folder")
     parser.add_argument("-o", "--output", type=Path, help="Output directory")
     parser.add_argument("-d", "--distance", type=float, required=True, help="Distance threshold for primary match")
@@ -985,10 +1120,28 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    args.mask_folder = normalize_cli_path(args.mask_folder, must_exist=True)
+    args.mask = normalize_cli_path(args.mask, must_exist=True)
     args.target = normalize_cli_path(args.target, must_exist=True)
     if args.output is not None:
         args.output = normalize_cli_path(args.output, must_exist=False)
+
+    mask_is_file = args.mask.is_file()
+    mask_is_folder = args.mask.is_dir()
+    if not mask_is_file and not mask_is_folder:
+        raise SystemExit("Invalid --mask path. Must be a folder or a single LAS/LAZ file")
+
+    field_names = [f.strip() for f in args.fields.split(",") if f.strip()]
+
+    if mask_is_file:
+        if args.mask.suffix.lower() not in (".las", ".laz"):
+            raise SystemExit("Single-file --mask must be a .las or .laz file")
+        if not field_names:
+            raise SystemExit("--fields may not be empty")
+    else:
+        if args.fields != "tree_id,stem_id":
+            stage("Warning: --fields is ignored in folder mask mode")
+        if args.mask_voxel_size > 0:
+            stage("Warning: --mask_voxel_size is ignored in folder mask mode")
 
     if args.ids_only and args.ply_only:
         raise SystemExit("Choose only one of --ids-only or --ply-only")
@@ -1017,7 +1170,7 @@ def main() -> None:
     write_las = not args.ply_only
     write_ply = not args.ids_only
 
-    out_dir = args.output if args.output else Path(f"{args.mask_folder.name}_extracted")
+    out_dir = args.output if args.output else Path(f"{args.mask.name}_extracted")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.target.is_dir():
@@ -1037,8 +1190,101 @@ def main() -> None:
     else:
         las_suffix = ".laz" if any(p.suffix.lower() == ".laz" for p in las_targets) else ".las"
 
+    if mask_is_file:
+        if args.hull_fill:
+            raise SystemExit("--hull_fill is not supported with a single-file mask")
+        if args.ply_only:
+            raise SystemExit("--ply_only is not supported with a single-file mask")
+        if any(p.suffix.lower() == ".ply" for p in target_files):
+            raise SystemExit("Single-file mask mode supports only LAS/LAZ targets, not PLY")
+        if args.debug:
+            stage("Warning: --debug is ignored in single-file mask mode (QC plots require folder mode)")
+            args.debug = False
+
+        with laspy.open(args.mask) as mask_src:
+            field_dtypes = {f: _field_dtype(mask_src.header, f) for f in field_names}
+
+        stage(f"Loading single-file mask: {args.mask.name}")
+        file_mask_source = load_file_mask(
+            path=args.mask,
+            fields=field_names,
+            distance=args.distance,
+            chunk_size=args.chunk_size,
+            mask_voxel_size=args.mask_voxel_size,
+            fast_index_build=args.fast_index_build,
+        )
+
+        stage(f"Processing {len(target_files)} target file(s)")
+        stage(f"Primary assignment distance: {args.distance}")
+        stage(f"Transferring fields: {', '.join(field_names)}")
+
+        total_points = 0
+        assigned_points = 0
+        chunks_seen = 0
+        last_heartbeat_t = time.time()
+        start_time = time.time()
+        las_output_paths: List[Path] = []
+
+        for target_file in target_files:
+            stage(f"Target: {target_file.name}")
+            with contextlib.ExitStack() as stack:
+                src = stack.enter_context(laspy.open(target_file))
+                src_dim_names = list(src.header.point_format.dimension_names)
+                out_header = build_las_header_with_fields(src.header, field_names, field_dtypes)
+
+                masked_out = out_dir / f"{target_file.stem}_masked{las_suffix}"
+                if masked_out.exists():
+                    masked_out.unlink()
+                las_output_paths.append(masked_out)
+                las_writer = stack.enter_context(laspy.open(masked_out, mode="w", header=out_header))
+
+                with tqdm(
+                    total=int(src.header.point_count),
+                    unit="pts",
+                    desc=f"Assign {target_file.name}",
+                    **PROGRESS_KW,
+                ) as pbar_assign:
+                    for chunk in src.chunk_iterator(args.chunk_size):
+                        chunk_xyz = np.vstack((chunk.x, chunk.y, chunk.z)).T.astype(np.float32, copy=False)
+                        if chunk_xyz.shape[0] == 0:
+                            continue
+                        n_chunk_pts = int(chunk_xyz.shape[0])
+                        total_points += n_chunk_pts
+
+                        field_vals = assign_fields_for_chunk(
+                            chunk_xyz,
+                            file_mask_source,
+                            args.distance,
+                            query_workers=args.query_workers,
+                        )
+                        chunks_seen += 1
+                        assigned_points += int(np.sum(field_vals[field_names[0]] != 0))
+
+                        rec = make_point_record_with_fields(
+                            chunk_subset=chunk,
+                            out_header=out_header,
+                            src_dim_names=src_dim_names,
+                            field_value_arrays=field_vals,
+                        )
+                        las_writer.write_points(rec)
+
+                        pbar_assign.update(n_chunk_pts)
+
+                        now_t = time.time()
+                        if now_t - last_heartbeat_t >= 20.0:
+                            stage(
+                                f"Heartbeat: processed {chunks_seen} chunk(s), "
+                                f"scanned {total_points} point(s), assigned {assigned_points}"
+                            )
+                            last_heartbeat_t = now_t
+
+        elapsed = time.time() - start_time
+        stage(f"Done in {elapsed:.2f}s. Scanned {total_points} points; assigned {assigned_points}.")
+        stage("Wrote masked LAS/LAZ outputs: " + ", ".join(str(p) for p in las_output_paths))
+        return
+
     masks = load_masks(
-        mask_folder=args.mask_folder,
+        mask_folder=args.mask,
         distance=args.distance,
         use_hull_fill=args.hull_fill,
         vox_mul=args.vox_mul,
