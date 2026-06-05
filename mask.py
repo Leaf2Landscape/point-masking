@@ -165,6 +165,7 @@ class FileMaskSource:
     tree: cKDTree
     field_names: List[str]
     field_arrays: Dict[str, np.ndarray]
+    raw_xy_bounds: Tuple[float, float, float, float]  # (min_x, min_y, max_x, max_y) computed BEFORE voxel downsampling
 
 
 def _field_dtype(header: laspy.LasHeader, field_name: str) -> np.dtype:
@@ -209,6 +210,13 @@ def load_file_mask(
                 field_bufs[f][offset:offset + n] = np.asarray(getattr(chunk, f))
             offset += n
 
+    raw_xy_bounds = (
+        float(xyz_buf[:offset, 0].min()),
+        float(xyz_buf[:offset, 1].min()),
+        float(xyz_buf[:offset, 0].max()),
+        float(xyz_buf[:offset, 1].max()),
+    )
+
     if mask_voxel_size > 0:
         vox = np.floor(xyz_buf / mask_voxel_size).astype(np.int64)
         _, idx = np.unique(vox, axis=0, return_index=True)
@@ -223,7 +231,7 @@ def load_file_mask(
         compact_nodes=not fast_index_build,
         balanced_tree=not fast_index_build,
     )
-    return FileMaskSource(points=xyz_buf, tree=tree, field_names=fields, field_arrays=field_bufs)
+    return FileMaskSource(points=xyz_buf, tree=tree, field_names=fields, field_arrays=field_bufs, raw_xy_bounds=raw_xy_bounds)
 
 
 def assign_fields_for_chunk(
@@ -386,6 +394,27 @@ def build_hull_info(points: np.ndarray, distance: float, vox_mul: float) -> Opti
         b=b,
         hull_points=hull_pts.astype(np.float32, copy=False),
     )
+
+
+def compute_crop_bounds_file(source: FileMaskSource) -> Tuple[float, float, float, float]:
+    return (
+        float(source.raw_xy_bounds[0]),
+        float(source.raw_xy_bounds[1]),
+        float(source.raw_xy_bounds[2]),
+        float(source.raw_xy_bounds[3]),
+    )
+
+
+def compute_crop_bounds_folder(masks: List[MaskRecord]) -> Tuple[float, float, float, float]:
+    raw_min_x = float(min(float(m.points[:, 0].min()) for m in masks))
+    raw_min_y = float(min(float(m.points[:, 1].min()) for m in masks))
+    raw_max_x = float(max(float(m.points[:, 0].max()) for m in masks))
+    raw_max_y = float(max(float(m.points[:, 1].max()) for m in masks))
+    crop_min_x = float(np.floor((raw_min_x - 10.0) / 10.0) * 10.0)
+    crop_min_y = float(np.floor((raw_min_y - 10.0) / 10.0) * 10.0)
+    crop_max_x = float(np.ceil((raw_max_x + 10.0) / 10.0) * 10.0)
+    crop_max_y = float(np.ceil((raw_max_y + 10.0) / 10.0) * 10.0)
+    return (crop_min_x, crop_min_y, crop_max_x, crop_max_y)
 
 
 def load_masks(
@@ -1118,6 +1147,11 @@ def main() -> None:
         action="store_true",
         help="Build less-balanced KD-trees to reduce startup time (query phase may be slower)",
     )
+    parser.add_argument(
+        "--crop",
+        action="store_true",
+        help="Crop target points to the XY bounding box of the mask(s) before assignment",
+    )
     args = parser.parse_args()
 
     args.mask = normalize_cli_path(args.mask, must_exist=True)
@@ -1214,6 +1248,14 @@ def main() -> None:
             fast_index_build=args.fast_index_build,
         )
 
+        crop_xy: Optional[Tuple[float, float, float, float]] = None
+        if args.crop:
+            crop_xy = compute_crop_bounds_file(file_mask_source)
+            stage(
+                f"Crop enabled: XY min=({crop_xy[0]:.3f}, {crop_xy[1]:.3f})  "
+                f"max=({crop_xy[2]:.3f}, {crop_xy[3]:.3f})"
+            )
+
         stage(f"Processing {len(target_files)} target file(s)")
         stage(f"Primary assignment distance: {args.distance}")
         stage(f"Transferring fields: {', '.join(field_names)}")
@@ -1248,8 +1290,20 @@ def main() -> None:
                         chunk_xyz = np.vstack((chunk.x, chunk.y, chunk.z)).T.astype(np.float32, copy=False)
                         if chunk_xyz.shape[0] == 0:
                             continue
-                        n_chunk_pts = int(chunk_xyz.shape[0])
-                        total_points += n_chunk_pts
+                        n_pts_scanned = int(chunk_xyz.shape[0])
+                        # XY crop
+                        if crop_xy is not None:
+                            in_crop = (
+                                (chunk_xyz[:, 0] >= crop_xy[0]) & (chunk_xyz[:, 0] <= crop_xy[2]) &
+                                (chunk_xyz[:, 1] >= crop_xy[1]) & (chunk_xyz[:, 1] <= crop_xy[3])
+                            )
+                            if not np.any(in_crop):
+                                total_points += n_pts_scanned
+                                pbar_assign.update(n_pts_scanned)
+                                continue
+                            chunk_xyz = chunk_xyz[in_crop]
+                            chunk = chunk[in_crop]
+                        total_points += n_pts_scanned
 
                         field_vals = assign_fields_for_chunk(
                             chunk_xyz,
@@ -1268,7 +1322,7 @@ def main() -> None:
                         )
                         las_writer.write_points(rec)
 
-                        pbar_assign.update(n_chunk_pts)
+                        pbar_assign.update(n_pts_scanned)
 
                         now_t = time.time()
                         if now_t - last_heartbeat_t >= 20.0:
@@ -1295,6 +1349,14 @@ def main() -> None:
         index_workers_auto=index_workers_auto,
         fast_index_build=args.fast_index_build,
     )
+
+    crop_xy: Optional[Tuple[float, float, float, float]] = None
+    if args.crop:
+        crop_xy = compute_crop_bounds_folder(masks)
+        stage(
+            f"Crop enabled: XY min=({crop_xy[0]:.3f}, {crop_xy[1]:.3f})  "
+            f"max=({crop_xy[2]:.3f}, {crop_xy[3]:.3f})"
+        )
 
     mask_tree_ids = np.asarray([m.tree_id for m in masks], dtype=np.int32)
     mask_stem_ids = np.asarray([m.stem_id for m in masks], dtype=np.int32)
@@ -1357,8 +1419,20 @@ def main() -> None:
                         chunk_xyz = np.vstack((chunk.x, chunk.y, chunk.z)).T.astype(np.float32, copy=False)
                         if chunk_xyz.shape[0] == 0:
                             continue
-                        n_chunk_pts = int(chunk_xyz.shape[0])
-                        total_points += n_chunk_pts
+                        n_pts_scanned = int(chunk_xyz.shape[0])
+                        # XY crop
+                        if crop_xy is not None:
+                            in_crop = (
+                                (chunk_xyz[:, 0] >= crop_xy[0]) & (chunk_xyz[:, 0] <= crop_xy[2]) &
+                                (chunk_xyz[:, 1] >= crop_xy[1]) & (chunk_xyz[:, 1] <= crop_xy[3])
+                            )
+                            if not np.any(in_crop):
+                                total_points += n_pts_scanned
+                                pbar_assign.update(n_pts_scanned)
+                                continue
+                            chunk_xyz = chunk_xyz[in_crop]
+                            chunk = chunk[in_crop]
+                        total_points += n_pts_scanned
 
                         matched_mask_idx = process_chunk(
                             chunk_xyz,
@@ -1405,7 +1479,7 @@ def main() -> None:
                                 recs["stem_id"] = mask.stem_id
                                 ply_appenders[(mask.tree_id, mask.stem_id)].append(recs)
 
-                        pbar_assign.update(n_chunk_pts)
+                        pbar_assign.update(n_pts_scanned)
 
                         now_t = time.time()
                         if now_t - last_heartbeat_t >= 20.0:
@@ -1440,6 +1514,16 @@ def main() -> None:
                         continue
                     n_chunk_pts = int(chunk_xyz.shape[0])
                     total_points += n_chunk_pts
+
+                    if crop_xy is not None:
+                        in_crop = (
+                            (chunk_xyz[:, 0] >= crop_xy[0]) & (chunk_xyz[:, 0] <= crop_xy[2]) &
+                            (chunk_xyz[:, 1] >= crop_xy[1]) & (chunk_xyz[:, 1] <= crop_xy[3])
+                        )
+                        if not np.any(in_crop):
+                            pbar_assign.update(n_chunk_pts)
+                            continue
+                        chunk_xyz = chunk_xyz[in_crop]
 
                     matched_mask_idx = process_chunk(
                         chunk_xyz,
