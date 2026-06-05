@@ -239,19 +239,20 @@ def assign_fields_for_chunk(
     source: FileMaskSource,
     distance: float,
     query_workers: int,
-) -> Dict[str, np.ndarray]:
+) -> Tuple[Dict[str, np.ndarray], int]:
     n = chunk_xyz.shape[0]
     dists, idxs = source.tree.query(
         chunk_xyz, k=1, distance_upper_bound=distance, workers=query_workers
     )
     matched = dists != np.inf
+    match_count = int(np.count_nonzero(matched))
     out: Dict[str, np.ndarray] = {}
     for f in source.field_names:
         arr = np.zeros(n, dtype=source.field_arrays[f].dtype)
-        if np.any(matched):
+        if match_count > 0:
             arr[matched] = source.field_arrays[f][idxs[matched]]
         out[f] = arr
-    return out
+    return out, match_count
 
 
 def build_mask_record(
@@ -1305,14 +1306,14 @@ def main() -> None:
                             chunk = chunk[in_crop]
                         total_points += n_pts_scanned
 
-                        field_vals = assign_fields_for_chunk(
+                        field_vals, n_matched = assign_fields_for_chunk(
                             chunk_xyz,
                             file_mask_source,
                             args.distance,
                             query_workers=args.query_workers,
                         )
                         chunks_seen += 1
-                        assigned_points += int(np.sum(field_vals[field_names[0]] != 0))
+                        assigned_points += n_matched
 
                         rec = make_point_record_with_fields(
                             chunk_subset=chunk,
