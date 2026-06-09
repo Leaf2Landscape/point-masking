@@ -7,9 +7,36 @@ This repository contains two related tools:
 
 ## Installation
 
+Install the package from the repository root:
+
 ```bash
-pip install numpy scipy plyfile tqdm
-pip install "laspy[lazrs]"
+python -m pip install .
+```
+
+For editable development install:
+
+```bash
+python -m pip install -e .
+```
+
+Optional extras:
+
+```bash
+python -m pip install .[plot]
+python -m pip install .[open3d]
+python -m pip install .[all]
+```
+
+This package installs two console scripts:
+
+- `point-masking-mask` -> runs `mask.py`
+- `point-masking-segfix` -> runs `segfix_trees.py`
+
+If you only need the core dependencies, the following are still required:
+
+```bash
+python -m pip install numpy scipy plyfile tqdm
+python -m pip install "laspy[lazrs]"
 ```
 
 ## Tool 1: mask.py

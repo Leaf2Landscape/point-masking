@@ -1,1 +1,5 @@
 .vscode/launch.json
+.claude/
+__pycache__/
+.conda/
+*.egg-info/
