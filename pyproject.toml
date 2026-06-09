@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "point-masking"
+version = "0.1.0"
+description = "Point-cloud mask assignment and extraction tools for LAS/LAZ/PLY data."
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy",
+  "scipy",
+  "plyfile",
+  "tqdm",
+  "laspy[lazrs]",
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Operating System :: OS Independent",
+]
+keywords = ["lidar", "point-cloud", "las", "laz", "ply", "masking", "segmentation"]
+
+[project.optional-dependencies]
+plot = ["matplotlib"]
+all = ["matplotlib"]
+
+[project.scripts]
+point-masking-mask = "mask:main"
+point-masking-segfix = "segfix_trees:main"
+
+[tool.setuptools]
+py-modules = ["mask", "segfix_trees"]
