@@ -8,6 +8,6 @@ dependencies:
   - numpy
   - scipy
   - pip:
-    - plyfile
-    - tqdm
-    - laspy[lazrs]  # Includes the Rust backend for fast LAZ compression
+      - plyfile
+      - tqdm
+      - laspy[lazrs]
