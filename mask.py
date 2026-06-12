@@ -112,29 +112,29 @@ def get_points(filepath: Path, chunk_size: int = 500000, progress_desc: Optional
     return np.empty((0, 3), dtype=np.float32)
 
 
-def parse_mask_ids(stem: str) -> Tuple[int, int]:
+def parse_mask_ids(stem: str) -> Tuple[int, int, bool]:
     parts = stem.split("_")
     if len(parts) == 1:
-        tree_s, stem_s = parts[0], "1"
+        tree_s, stem_s, has_stem_id = parts[0], None, False
     elif len(parts) == 2:
-        tree_s, stem_s = parts
+        tree_s, stem_s, has_stem_id = parts[0], parts[1], True
     else:
         raise ValueError(
             f"Invalid mask filename '{stem}'. Expected {{tree_id}} or {{tree_id}}_{{stem_id}}"
         )
 
-    if not tree_s.isdigit() or not stem_s.isdigit():
+    if not tree_s.isdigit() or (stem_s is not None and not stem_s.isdigit()):
         raise ValueError(
             f"Invalid mask filename '{stem}'. tree_id/stem_id must be positive integers"
         )
 
     tree_id = int(tree_s)
-    stem_id = int(stem_s)
+    stem_id = int(stem_s) if stem_s is not None else 0
     if tree_id < 1 or tree_id >= 20000:
         raise ValueError(f"Invalid tree_id={tree_id} in '{stem}'. Expected 1..19999")
-    if stem_id < 1 or stem_id >= 27:
+    if has_stem_id and (stem_id < 1 or stem_id >= 27):
         raise ValueError(f"Invalid stem_id={stem_id} in '{stem}'. Expected 1..26")
-    return tree_id, stem_id
+    return tree_id, stem_id, has_stem_id
 
 
 @dataclass
@@ -150,6 +150,7 @@ class HullInfo:
 class MaskRecord:
     tree_id: int
     stem_id: int
+    has_stem_id: bool
     points: np.ndarray
     tree: cKDTree
     mins: np.ndarray
@@ -262,6 +263,7 @@ def assign_fields_for_chunk(
 def build_mask_record(
     tree_id: int,
     stem_id: int,
+    has_stem_id: bool,
     point_sets: List[np.ndarray],
     distance: float,
     use_hull_fill: bool,
@@ -279,7 +281,7 @@ def build_mask_record(
     )
     mins = np.min(pts, axis=0).astype(np.float32) - float(distance)
     maxs = np.max(pts, axis=0).astype(np.float32) + float(distance)
-    key_name = f"{tree_id}_{stem_id}"
+    key_name = f"{tree_id}_{stem_id}" if has_stem_id else f"{tree_id}"
 
     hull = None
     if use_hull_fill:
@@ -288,6 +290,7 @@ def build_mask_record(
     return MaskRecord(
         tree_id=tree_id,
         stem_id=stem_id,
+        has_stem_id=has_stem_id,
         points=pts,
         tree=tree,
         mins=mins,
@@ -435,6 +438,7 @@ def load_masks(
     fast_index_build: bool,
 ) -> List[MaskRecord]:
     grouped: Dict[Tuple[int, int], List[np.ndarray]] = {}
+    grouped_has_stem: Dict[Tuple[int, int], bool] = {}
     mask_files = list_point_files(mask_folder)
     if not mask_files:
         raise SystemExit("No mask files found.")
@@ -442,7 +446,7 @@ def load_masks(
     stage(f"Loading {len(mask_files)} mask file(s)")
     for path in tqdm(mask_files, unit="mask", desc="Load masks", **PROGRESS_KW):
         try:
-            tree_id, stem_id = parse_mask_ids(path.stem)
+            tree_id, stem_id, has_stem_id = parse_mask_ids(path.stem)
         except ValueError as exc:
             raise SystemExit(str(exc)) from exc
 
@@ -450,7 +454,9 @@ def load_masks(
         pts = get_points(path, chunk_size=load_chunk_size, progress_desc=read_desc)
         if pts.shape[0] == 0:
             continue
-        grouped.setdefault((tree_id, stem_id), []).append(pts)
+        key = (tree_id, stem_id)
+        grouped.setdefault(key, []).append(pts)
+        grouped_has_stem[key] = has_stem_id
 
     if not grouped:
         raise SystemExit("No usable mask points found.")
@@ -498,6 +504,7 @@ def load_masks(
                 build_mask_record(
                     tree_id=tree_id,
                     stem_id=stem_id,
+                    has_stem_id=grouped_has_stem[(tree_id, stem_id)],
                     point_sets=point_sets,
                     distance=distance,
                     use_hull_fill=use_hull_fill,
@@ -513,15 +520,16 @@ def load_masks(
             for (tree_id, stem_id), point_sets in grouped_items:
                 fut = pool.submit(
                     build_mask_record,
-                    tree_id,
-                    stem_id,
-                    point_sets,
-                    distance,
-                    use_hull_fill,
-                    vox_mul,
-                    out_dir,
-                    las_suffix,
-                    fast_index_build,
+                    tree_id=tree_id,
+                    stem_id=stem_id,
+                    has_stem_id=grouped_has_stem[(tree_id, stem_id)],
+                    point_sets=point_sets,
+                    distance=distance,
+                    use_hull_fill=use_hull_fill,
+                    vox_mul=vox_mul,
+                    out_dir=out_dir,
+                    las_suffix=las_suffix,
+                    fast_index_build=fast_index_build,
                 )
                 futures[fut] = (tree_id, stem_id)
 
@@ -671,12 +679,12 @@ def process_chunk(
     return matched_mask_idx
 
 
-def build_las_header_with_ids(src_header: laspy.LasHeader) -> laspy.LasHeader:
+def build_las_header_with_ids(src_header: laspy.LasHeader, write_stem_id: bool = True) -> laspy.LasHeader:
     out_header = src_header.copy()
     dim_names = set(out_header.point_format.dimension_names)
     if "tree_id" not in dim_names:
         out_header.add_extra_dim(ExtraBytesParams(name="tree_id", type=np.int32))
-    if "stem_id" not in dim_names:
+    if write_stem_id and "stem_id" not in dim_names:
         out_header.add_extra_dim(ExtraBytesParams(name="stem_id", type=np.int32))
     return out_header
 
@@ -687,6 +695,7 @@ def make_point_record_with_ids(
     src_dim_names: List[str],
     tree_id,
     stem_id,
+    write_stem_id: bool = True,
 ):
     rec = ScaleAwarePointRecord.zeros(len(chunk_subset), header=out_header)
     for dim in src_dim_names:
@@ -698,10 +707,11 @@ def make_point_record_with_ids(
         rec.tree_id = np.full(len(chunk_subset), tree_id, dtype=np.int32)
     else:
         rec.tree_id = np.asarray(tree_id, dtype=np.int32)
-    if np.isscalar(stem_id):
-        rec.stem_id = np.full(len(chunk_subset), stem_id, dtype=np.int32)
-    else:
-        rec.stem_id = np.asarray(stem_id, dtype=np.int32)
+    if write_stem_id:
+        if np.isscalar(stem_id):
+            rec.stem_id = np.full(len(chunk_subset), stem_id, dtype=np.int32)
+        else:
+            rec.stem_id = np.asarray(stem_id, dtype=np.int32)
     return rec
 
 
@@ -1390,18 +1400,15 @@ def main() -> None:
             f"max=({crop_xy[2]:.3f}, {crop_xy[3]:.3f})"
         )
 
+    write_stem_id = any(m.has_stem_id for m in masks)
+
     mask_tree_ids = np.asarray([m.tree_id for m in masks], dtype=np.int32)
     mask_stem_ids = np.asarray([m.stem_id for m in masks], dtype=np.int32)
 
-    ply_dtype = np.dtype(
-        [
-            ("x", "<f4"),
-            ("y", "<f4"),
-            ("z", "<f4"),
-            ("tree_id", "<i4"),
-            ("stem_id", "<i4"),
-        ]
-    )
+    ply_fields = [("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("tree_id", "<i4")]
+    if write_stem_id:
+        ply_fields.append(("stem_id", "<i4"))
+    ply_dtype = np.dtype(ply_fields)
     ply_appenders: Dict[Tuple[int, int], PlyStructAppender] = {}
     if write_ply:
         for m in masks:
@@ -1433,7 +1440,7 @@ def main() -> None:
                 src = stack.enter_context(laspy.open(target_file))
                 src_dim_names = list(src.header.point_format.dimension_names)
                 has_bound_field = "bound" in src_dim_names
-                out_header = build_las_header_with_ids(src.header) if write_las else None
+                out_header = build_las_header_with_ids(src.header, write_stem_id=write_stem_id) if write_las else None
 
                 las_writer = None
                 if write_las:
@@ -1479,6 +1486,7 @@ def main() -> None:
                                     src_dim_names=src_dim_names,
                                     tree_id=np.full(n_unbound, -1, dtype=np.int32),
                                     stem_id=np.full(n_unbound, -1, dtype=np.int32),
+                                    write_stem_id=write_stem_id,
                                 )
                                 las_writer.write_points(rec)
                             unbound_points += n_unbound
@@ -1505,16 +1513,18 @@ def main() -> None:
                             matched_sel = matched_mask_idx >= 0
                             if write_las and las_writer is not None:
                                 tree_ids = np.zeros(bound_xyz.shape[0], dtype=np.int32)
-                                stem_ids = np.zeros(bound_xyz.shape[0], dtype=np.int32)
+                                stem_ids = np.zeros(bound_xyz.shape[0], dtype=np.int32) if write_stem_id else None
                                 if np.any(matched_sel):
                                     tree_ids[matched_sel] = mask_tree_ids[matched_mask_idx[matched_sel]]
-                                    stem_ids[matched_sel] = mask_stem_ids[matched_mask_idx[matched_sel]]
+                                    if write_stem_id:
+                                        stem_ids[matched_sel] = mask_stem_ids[matched_mask_idx[matched_sel]]
                                 rec = make_point_record_with_ids(
                                     chunk_subset=bound_chunk,
                                     out_header=out_header,
                                     src_dim_names=src_dim_names,
                                     tree_id=tree_ids,
                                     stem_id=stem_ids,
+                                    write_stem_id=write_stem_id,
                                 )
                                 las_writer.write_points(rec)
 
@@ -1534,7 +1544,8 @@ def main() -> None:
                                     recs["y"] = pts[:, 1]
                                     recs["z"] = pts[:, 2]
                                     recs["tree_id"] = mask.tree_id
-                                    recs["stem_id"] = mask.stem_id
+                                    if write_stem_id:
+                                        recs["stem_id"] = mask.stem_id
                                     ply_appenders[(mask.tree_id, mask.stem_id)].append(recs)
 
                         chunks_seen += 1
@@ -1610,7 +1621,8 @@ def main() -> None:
                             recs["y"] = sel_pts[:, 1]
                             recs["z"] = sel_pts[:, 2]
                             recs["tree_id"] = mask.tree_id
-                            recs["stem_id"] = mask.stem_id
+                            if write_stem_id:
+                                recs["stem_id"] = mask.stem_id
                             ply_appenders[(mask.tree_id, mask.stem_id)].append(recs)
 
                     pbar_assign.update(n_chunk_pts)
