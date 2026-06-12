@@ -1297,51 +1297,49 @@ def main() -> None:
                         if chunk_xyz.shape[0] == 0:
                             continue
                         n_pts_scanned = int(chunk_xyz.shape[0])
-                        # XY crop — unbound points (bound == 0) bypass the crop filter
+                        total_points += n_pts_scanned
+
+                        # Identify unbound points — they bypass both crop and masking
+                        is_unbound = (
+                            np.asarray(chunk.bound) == 0
+                            if has_bound_field
+                            else np.zeros(n_pts_scanned, dtype=bool)
+                        )
+
+                        # XY crop — bound points only; unbound always pass through
                         if crop_xy is not None:
                             in_crop = (
                                 (chunk_xyz[:, 0] >= crop_xy[0]) & (chunk_xyz[:, 0] <= crop_xy[2]) &
                                 (chunk_xyz[:, 1] >= crop_xy[1]) & (chunk_xyz[:, 1] <= crop_xy[3])
                             )
-                            if has_bound_field:
-                                in_crop = in_crop | (np.asarray(chunk.bound) == 0)
-                            if not np.any(in_crop):
-                                total_points += n_pts_scanned
+                            keep = in_crop | is_unbound
+                            if not np.any(keep):
                                 pbar_assign.update(n_pts_scanned)
                                 continue
-                            chunk_xyz = chunk_xyz[in_crop]
-                            chunk = chunk[in_crop]
-                        total_points += n_pts_scanned
+                            chunk_xyz = chunk_xyz[keep]
+                            chunk = chunk[keep]
+                            is_unbound = is_unbound[keep]
 
-                        if has_bound_field:
-                            is_unbound = np.asarray(chunk.bound) == 0
-                            bound_sel = ~is_unbound
-                            if np.any(bound_sel):
-                                bound_vals, n_matched = assign_fields_for_chunk(
-                                    chunk_xyz[bound_sel],
-                                    file_mask_source,
-                                    args.distance,
-                                    query_workers=args.query_workers,
-                                )
-                                n_total = chunk_xyz.shape[0]
-                                field_vals = {}
-                                for f, arr in bound_vals.items():
-                                    full = np.full(n_total, _no_mask_fill(arr.dtype), dtype=arr.dtype)
-                                    full[bound_sel] = arr
-                                    field_vals[f] = full
-                            else:
-                                n_matched = 0
-                                field_vals = {
-                                    f: np.full(chunk_xyz.shape[0], _no_mask_fill(file_mask_source.field_arrays[f].dtype), dtype=file_mask_source.field_arrays[f].dtype)
-                                    for f in file_mask_source.field_names
-                                }
-                        else:
-                            field_vals, n_matched = assign_fields_for_chunk(
-                                chunk_xyz,
+                        bound_sel = ~is_unbound
+                        if np.any(bound_sel):
+                            bound_vals, n_matched = assign_fields_for_chunk(
+                                chunk_xyz[bound_sel],
                                 file_mask_source,
                                 args.distance,
                                 query_workers=args.query_workers,
                             )
+                            n_total = chunk_xyz.shape[0]
+                            field_vals = {}
+                            for f, arr in bound_vals.items():
+                                full = np.full(n_total, _no_mask_fill(arr.dtype), dtype=arr.dtype)
+                                full[bound_sel] = arr
+                                field_vals[f] = full
+                        else:
+                            n_matched = 0
+                            field_vals = {
+                                f: np.full(chunk_xyz.shape[0], _no_mask_fill(file_mask_source.field_arrays[f].dtype), dtype=file_mask_source.field_arrays[f].dtype)
+                                for f in file_mask_source.field_names
+                            }
                         chunks_seen += 1
                         assigned_points += n_matched
 
