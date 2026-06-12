@@ -1293,63 +1293,62 @@ def main() -> None:
                     **PROGRESS_KW,
                 ) as pbar_assign:
                     for chunk in src.chunk_iterator(args.chunk_size):
-                        chunk_xyz = np.vstack((chunk.x, chunk.y, chunk.z)).T.astype(np.float32, copy=False)
-                        if chunk_xyz.shape[0] == 0:
+                        n_pts_scanned = int(len(chunk.x))
+                        if n_pts_scanned == 0:
                             continue
-                        n_pts_scanned = int(chunk_xyz.shape[0])
                         total_points += n_pts_scanned
 
-                        # Identify unbound points — they bypass both crop and masking
-                        is_unbound = (
-                            np.asarray(chunk.bound) == 0 | np.asarray(chunk.bound) == 0.0
-                            if has_bound_field
-                            else np.zeros(n_pts_scanned, dtype=bool)
-                        )
-
-                        # XY crop — bound points only; unbound always pass through
-                        if crop_xy is not None:
-                            in_crop = (
-                                (chunk_xyz[:, 0] >= crop_xy[0]) & (chunk_xyz[:, 0] <= crop_xy[2]) &
-                                (chunk_xyz[:, 1] >= crop_xy[1]) & (chunk_xyz[:, 1] <= crop_xy[3])
-                            )
-                            keep = in_crop | is_unbound
-                            if not np.any(keep):
-                                pbar_assign.update(n_pts_scanned)
-                                continue
-                            chunk_xyz = chunk_xyz[keep]
-                            chunk = chunk[keep]
-                            is_unbound = is_unbound[keep]
-
-                        bound_sel = ~is_unbound
-                        if np.any(bound_sel):
-                            bound_vals, n_matched = assign_fields_for_chunk(
-                                chunk_xyz[bound_sel],
-                                file_mask_source,
-                                args.distance,
-                                query_workers=args.query_workers,
-                            )
-                            n_total = chunk_xyz.shape[0]
-                            field_vals = {}
-                            for f, arr in bound_vals.items():
-                                full = np.full(n_total, _no_mask_fill(arr.dtype), dtype=arr.dtype)
-                                full[bound_sel] = arr
-                                field_vals[f] = full
+                        # Split unbound (bound == 0) from bound immediately.
+                        # Unbound points stream straight to output; only bound points
+                        # go through crop and KD-tree assignment.
+                        if has_bound_field:
+                            is_unbound = np.asarray(chunk.bound) == 0
+                            unbound_chunk = chunk[is_unbound]
+                            bound_chunk   = chunk[~is_unbound]
                         else:
-                            n_matched = 0
-                            field_vals = {
-                                f: np.full(chunk_xyz.shape[0], _no_mask_fill(file_mask_source.field_arrays[f].dtype), dtype=file_mask_source.field_arrays[f].dtype)
+                            unbound_chunk = None
+                            bound_chunk   = chunk
+
+                        # Stream unbound points directly to output with fill values
+                        if unbound_chunk is not None and len(unbound_chunk.x) > 0:
+                            fill_vals = {
+                                f: np.full(len(unbound_chunk.x), _no_mask_fill(file_mask_source.field_arrays[f].dtype), dtype=file_mask_source.field_arrays[f].dtype)
                                 for f in file_mask_source.field_names
                             }
+                            las_writer.write_points(make_point_record_with_fields(
+                                chunk_subset=unbound_chunk,
+                                out_header=out_header,
+                                src_dim_names=src_dim_names,
+                                field_value_arrays=fill_vals,
+                            ))
+
+                        # Crop and mask bound points
+                        n_matched = 0
+                        if len(bound_chunk.x) > 0:
+                            bound_xyz = np.vstack((bound_chunk.x, bound_chunk.y, bound_chunk.z)).T.astype(np.float32, copy=False)
+                            if crop_xy is not None:
+                                in_crop = (
+                                    (bound_xyz[:, 0] >= crop_xy[0]) & (bound_xyz[:, 0] <= crop_xy[2]) &
+                                    (bound_xyz[:, 1] >= crop_xy[1]) & (bound_xyz[:, 1] <= crop_xy[3])
+                                )
+                                bound_xyz  = bound_xyz[in_crop]
+                                bound_chunk = bound_chunk[in_crop]
+                            if len(bound_chunk.x) > 0:
+                                field_vals, n_matched = assign_fields_for_chunk(
+                                    bound_xyz,
+                                    file_mask_source,
+                                    args.distance,
+                                    query_workers=args.query_workers,
+                                )
+                                las_writer.write_points(make_point_record_with_fields(
+                                    chunk_subset=bound_chunk,
+                                    out_header=out_header,
+                                    src_dim_names=src_dim_names,
+                                    field_value_arrays=field_vals,
+                                ))
+
                         chunks_seen += 1
                         assigned_points += n_matched
-
-                        rec = make_point_record_with_fields(
-                            chunk_subset=chunk,
-                            out_header=out_header,
-                            src_dim_names=src_dim_names,
-                            field_value_arrays=field_vals,
-                        )
-                        las_writer.write_points(rec)
 
                         pbar_assign.update(n_pts_scanned)
 
