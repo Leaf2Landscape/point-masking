@@ -1273,6 +1273,7 @@ def main() -> None:
             with contextlib.ExitStack() as stack:
                 src = stack.enter_context(laspy.open(target_file))
                 src_dim_names = list(src.header.point_format.dimension_names)
+                has_bound_field = "bound" in src_dim_names
                 out_header = build_las_header_with_fields(src.header, field_names, field_dtypes)
 
                 masked_out = out_dir / f"{target_file.stem}_masked{las_suffix}"
@@ -1292,12 +1293,14 @@ def main() -> None:
                         if chunk_xyz.shape[0] == 0:
                             continue
                         n_pts_scanned = int(chunk_xyz.shape[0])
-                        # XY crop
+                        # XY crop — unbound points (bound == 0) bypass the crop filter
                         if crop_xy is not None:
                             in_crop = (
                                 (chunk_xyz[:, 0] >= crop_xy[0]) & (chunk_xyz[:, 0] <= crop_xy[2]) &
                                 (chunk_xyz[:, 1] >= crop_xy[1]) & (chunk_xyz[:, 1] <= crop_xy[3])
                             )
+                            if has_bound_field:
+                                in_crop = in_crop | (np.asarray(chunk.bound) == 0)
                             if not np.any(in_crop):
                                 total_points += n_pts_scanned
                                 pbar_assign.update(n_pts_scanned)
@@ -1400,6 +1403,7 @@ def main() -> None:
             with contextlib.ExitStack() as stack:
                 src = stack.enter_context(laspy.open(target_file))
                 src_dim_names = list(src.header.point_format.dimension_names)
+                has_bound_field = "bound" in src_dim_names
                 out_header = build_las_header_with_ids(src.header) if write_las else None
 
                 las_writer = None
@@ -1421,12 +1425,14 @@ def main() -> None:
                         if chunk_xyz.shape[0] == 0:
                             continue
                         n_pts_scanned = int(chunk_xyz.shape[0])
-                        # XY crop
+                        # XY crop — unbound points (bound == 0) bypass the crop filter
                         if crop_xy is not None:
                             in_crop = (
                                 (chunk_xyz[:, 0] >= crop_xy[0]) & (chunk_xyz[:, 0] <= crop_xy[2]) &
                                 (chunk_xyz[:, 1] >= crop_xy[1]) & (chunk_xyz[:, 1] <= crop_xy[3])
                             )
+                            if has_bound_field:
+                                in_crop = in_crop | (np.asarray(chunk.bound) == 0)
                             if not np.any(in_crop):
                                 total_points += n_pts_scanned
                                 pbar_assign.update(n_pts_scanned)
