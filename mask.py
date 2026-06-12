@@ -168,6 +168,10 @@ class FileMaskSource:
     raw_xy_bounds: Tuple[float, float, float, float]  # (min_x, min_y, max_x, max_y) computed BEFORE voxel downsampling
 
 
+def _no_mask_fill(dtype: np.dtype) -> int:
+    return 0 if np.issubdtype(dtype, np.unsignedinteger) else -1
+
+
 def _field_dtype(header: laspy.LasHeader, field_name: str) -> np.dtype:
     dim_names = list(header.point_format.dimension_names)
     if field_name in dim_names:
@@ -1309,12 +1313,35 @@ def main() -> None:
                             chunk = chunk[in_crop]
                         total_points += n_pts_scanned
 
-                        field_vals, n_matched = assign_fields_for_chunk(
-                            chunk_xyz,
-                            file_mask_source,
-                            args.distance,
-                            query_workers=args.query_workers,
-                        )
+                        if has_bound_field:
+                            is_unbound = np.asarray(chunk.bound) == 0
+                            bound_sel = ~is_unbound
+                            if np.any(bound_sel):
+                                bound_vals, n_matched = assign_fields_for_chunk(
+                                    chunk_xyz[bound_sel],
+                                    file_mask_source,
+                                    args.distance,
+                                    query_workers=args.query_workers,
+                                )
+                                n_total = chunk_xyz.shape[0]
+                                field_vals = {}
+                                for f, arr in bound_vals.items():
+                                    full = np.full(n_total, _no_mask_fill(arr.dtype), dtype=arr.dtype)
+                                    full[bound_sel] = arr
+                                    field_vals[f] = full
+                            else:
+                                n_matched = 0
+                                field_vals = {
+                                    f: np.full(chunk_xyz.shape[0], _no_mask_fill(file_mask_source.field_arrays[f].dtype), dtype=file_mask_source.field_arrays[f].dtype)
+                                    for f in file_mask_source.field_names
+                                }
+                        else:
+                            field_vals, n_matched = assign_fields_for_chunk(
+                                chunk_xyz,
+                                file_mask_source,
+                                args.distance,
+                                query_workers=args.query_workers,
+                            )
                         chunks_seen += 1
                         assigned_points += n_matched
 
