@@ -1301,7 +1301,7 @@ def main() -> None:
 
                         # Identify unbound points — they bypass both crop and masking
                         is_unbound = (
-                            np.asarray(chunk.bound) == 0
+                            np.asarray(chunk.bound) == 0 | np.asarray(chunk.bound) == 0.0
                             if has_bound_field
                             else np.zeros(n_pts_scanned, dtype=bool)
                         )
