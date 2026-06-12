@@ -23,8 +23,8 @@ def make_mask(path: Path) -> None:
     header = laspy.LasHeader(point_format=6, version="1.4")
     header.offsets = np.array([0.0, 0.0, 0.0])
     header.scales = np.array([0.001, 0.001, 0.001])
-    header.add_extra_dim(ExtraBytesParams("tree_id", type=np.uint16))
-    header.add_extra_dim(ExtraBytesParams("stem_id", type=np.uint8))
+    header.add_extra_dim(ExtraBytesParams("tree_id", type=np.int32))
+    header.add_extra_dim(ExtraBytesParams("stem_id", type=np.int32))
 
     las = laspy.LasData(header=header)
     # Spread in XY so crop_bounds_file covers [-1, 1] x [-1, 1],
@@ -34,8 +34,8 @@ def make_mask(path: Path) -> None:
     las.x = xs
     las.y = ys
     las.z = np.zeros(len(xs))
-    las.tree_id = np.ones(len(xs), dtype=np.uint16)
-    las.stem_id = np.ones(len(xs), dtype=np.uint8)
+    las.tree_id = np.ones(len(xs), dtype=np.int32)
+    las.stem_id = np.ones(len(xs), dtype=np.int32)
     las.write(str(path))
 
 
@@ -105,9 +105,9 @@ def check(output_path: Path) -> None:
     assert np.all(tree_ids[bound_mask] == 1), f"Bound tree_ids wrong: {tree_ids[bound_mask]}"
     assert np.all(stem_ids[bound_mask] == 1), f"Bound stem_ids wrong: {stem_ids[bound_mask]}"
 
-    # Unbound points must have fill values: 0 for uint fields
-    assert np.all(tree_ids[unbound_mask] == 0), f"Unbound tree_ids should be 0, got: {tree_ids[unbound_mask]}"
-    assert np.all(stem_ids[unbound_mask] == 0), f"Unbound stem_ids should be 0, got: {stem_ids[unbound_mask]}"
+    # Unbound points must have sentinel fill value -1 (int32 fields)
+    assert np.all(tree_ids[unbound_mask] == -1), f"Unbound tree_ids should be -1, got: {tree_ids[unbound_mask]}"
+    assert np.all(stem_ids[unbound_mask] == -1), f"Unbound stem_ids should be -1, got: {stem_ids[unbound_mask]}"
 
     # Unbound XY must be preserved (~1000 m away)
     unbound_xs = xs[unbound_mask]

@@ -1267,6 +1267,7 @@ def main() -> None:
 
         total_points = 0
         assigned_points = 0
+        unbound_points = 0
         chunks_seen = 0
         last_heartbeat_t = time.time()
         start_time = time.time()
@@ -1311,8 +1312,9 @@ def main() -> None:
 
                         # Stream unbound points directly to output with fill values
                         if unbound_chunk is not None and len(unbound_chunk.x) > 0:
+                            n_unbound = len(unbound_chunk.x)
                             fill_vals = {
-                                f: np.full(len(unbound_chunk.x), _no_mask_fill(file_mask_source.field_arrays[f].dtype), dtype=file_mask_source.field_arrays[f].dtype)
+                                f: np.full(n_unbound, _no_mask_fill(file_mask_source.field_arrays[f].dtype), dtype=file_mask_source.field_arrays[f].dtype)
                                 for f in file_mask_source.field_names
                             }
                             las_writer.write_points(make_point_record_with_fields(
@@ -1321,6 +1323,7 @@ def main() -> None:
                                 src_dim_names=src_dim_names,
                                 field_value_arrays=fill_vals,
                             ))
+                            unbound_points += n_unbound
 
                         # Crop and mask bound points
                         n_matched = 0
@@ -1356,12 +1359,13 @@ def main() -> None:
                         if now_t - last_heartbeat_t >= 20.0:
                             stage(
                                 f"Heartbeat: processed {chunks_seen} chunk(s), "
-                                f"scanned {total_points} point(s), assigned {assigned_points}"
+                                f"scanned {total_points} point(s), "
+                                f"assigned {assigned_points}, unbound {unbound_points}"
                             )
                             last_heartbeat_t = now_t
 
         elapsed = time.time() - start_time
-        stage(f"Done in {elapsed:.2f}s. Scanned {total_points} points; assigned {assigned_points}.")
+        stage(f"Done in {elapsed:.2f}s. Scanned {total_points} points; assigned {assigned_points}, unbound {unbound_points}.")
         stage("Wrote masked LAS/LAZ outputs: " + ", ".join(str(p) for p in las_output_paths))
         return
 
