@@ -1344,6 +1344,19 @@ def main() -> None:
                                     (bound_xyz[:, 0] >= crop_xy[0]) & (bound_xyz[:, 0] <= crop_xy[2]) &
                                     (bound_xyz[:, 1] >= crop_xy[1]) & (bound_xyz[:, 1] <= crop_xy[3])
                                 )
+                                out_crop_chunk = bound_chunk[~in_crop]
+                                if len(out_crop_chunk.x) > 0:
+                                    n_out_crop = len(out_crop_chunk.x)
+                                    fill_vals = {
+                                        f: np.zeros(n_out_crop, dtype=file_mask_source.field_arrays[f].dtype)
+                                        for f in file_mask_source.field_names
+                                    }
+                                    las_writer.write_points(make_point_record_with_fields(
+                                        chunk_subset=out_crop_chunk,
+                                        out_header=out_header,
+                                        src_dim_names=src_dim_names,
+                                        field_value_arrays=fill_vals,
+                                    ))
                                 bound_xyz  = bound_xyz[in_crop]
                                 bound_chunk = bound_chunk[in_crop]
                             if len(bound_chunk.x) > 0:
@@ -1497,6 +1510,18 @@ def main() -> None:
                                 (bound_xyz[:, 0] >= crop_xy[0]) & (bound_xyz[:, 0] <= crop_xy[2]) &
                                 (bound_xyz[:, 1] >= crop_xy[1]) & (bound_xyz[:, 1] <= crop_xy[3])
                             )
+                            out_crop_chunk = bound_chunk[~in_crop]
+                            if write_las and las_writer is not None and len(out_crop_chunk.x) > 0:
+                                n_out_crop = len(out_crop_chunk.x)
+                                rec = make_point_record_with_ids(
+                                    chunk_subset=out_crop_chunk,
+                                    out_header=out_header,
+                                    src_dim_names=src_dim_names,
+                                    tree_id=np.zeros(n_out_crop, dtype=np.int32),
+                                    stem_id=np.zeros(n_out_crop, dtype=np.int32),
+                                    write_stem_id=write_stem_id,
+                                )
+                                las_writer.write_points(rec)
                             bound_xyz = bound_xyz[in_crop]
                             bound_chunk = bound_chunk[in_crop]
 
